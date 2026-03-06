@@ -247,139 +247,64 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int, debug_markers: bool = False
     ):
         """
-        Optimized vectorized implementation.
-        Processes VLEN elements at a time.
+        Baseline vectorized implementation.
         """
-        # Scratch space addresses for parameters
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        
-        tmp_scalar = self.alloc_scratch("tmp_scalar")
+        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"]
+        for v in init_vars: self.alloc_scratch(v, 1)
+        ts = self.alloc_scratch("ts")
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp_scalar, i))
-            self.add("load", ("load", self.scratch[v], tmp_scalar))
+            self.add("load", ("const", ts, i))
+            self.add("load", ("load", self.scratch[v], ts))
 
-        # Constants
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        v_zero = self.alloc_scratch("v_zero", VLEN); self.add("valu", ("vbroadcast", v_zero, self.scratch_const(0)))
+        v_one = self.alloc_scratch("v_one", VLEN); self.add("valu", ("vbroadcast", v_one, self.scratch_const(1)))
+        v_two = self.alloc_scratch("v_two", VLEN); self.add("valu", ("vbroadcast", v_two, self.scratch_const(2)))
+        v_nn = self.alloc_scratch("v_nn", VLEN); self.add("valu", ("vbroadcast", v_nn, self.scratch["n_nodes"]))
 
-        # Pre-broadcast constants to vectors
-        v_zero = self.alloc_scratch("v_zero", VLEN)
-        self.add("valu", ("vbroadcast", v_zero, zero_const))
-        v_one = self.alloc_scratch("v_one", VLEN)
-        self.add("valu", ("vbroadcast", v_one, one_const))
-        v_two = self.alloc_scratch("v_two", VLEN)
-        self.add("valu", ("vbroadcast", v_two, two_const))
+        v_idx = [self.alloc_scratch(f"vi_{b}", VLEN) for b in range(batch_size // VLEN)]
+        v_val = [self.alloc_scratch(f"vv_{b}", VLEN) for b in range(batch_size // VLEN)]
+        v_nv = [self.alloc_scratch(f"vnv_{b}", VLEN) for b in range(batch_size // VLEN)]
+        v_t1 = [self.alloc_scratch(f"vt1_{b}", VLEN) for b in range(batch_size // VLEN)]
+        v_t2 = [self.alloc_scratch(f"vt2_{b}", VLEN) for b in range(batch_size // VLEN)]
 
-        v_c1_map = {}
-        v_c3_map = {}
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            c1 = self.scratch_const(val1)
-            c3 = self.scratch_const(val3)
-            v_c1 = self.alloc_scratch(f"v_c1_{hi}", VLEN)
-            v_c3 = self.alloc_scratch(f"v_c3_{hi}", VLEN)
-            self.add("valu", ("vbroadcast", v_c1, c1))
-            self.add("valu", ("vbroadcast", v_c3, c3))
-            v_c1_map[hi] = v_c1
-            v_c3_map[hi] = v_c3
-
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
-        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
-        
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
-
-        # Pre-calculate batch addresses
-        batch_addr_idx_map = {}
-        batch_addr_val_map = {}
+        ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
+        ba_val = [self.alloc_scratch(f"bav_{i}") for i in range(0, batch_size, VLEN)]
         for i in range(0, batch_size, VLEN):
-            i_const = self.scratch_const(i)
-            addr_idx = self.alloc_scratch(f"batch_addr_idx_{i}")
-            addr_val = self.alloc_scratch(f"batch_addr_val_{i}")
-            self.add("alu", ("+", addr_idx, self.scratch["inp_indices_p"], i_const))
-            self.add("alu", ("+", addr_val, self.scratch["inp_values_p"], i_const))
-            batch_addr_idx_map[i] = addr_idx
-            batch_addr_val_map[i] = addr_val
+            self.add("alu", ("+", ba_idx[i//VLEN], self.scratch["inp_indices_p"], self.scratch_const(i)))
+            self.add("alu", ("+", ba_val[i//VLEN], self.scratch["inp_values_p"], self.scratch_const(i)))
 
-        # Preamble pause
         self.add("flow", ("pause",))
-
-        # Process all sub-batches together
-        N_BATCHES = batch_size // VLEN
-        
-        v_indices = [self.alloc_scratch(f"v_idx_{b}", VLEN) for b in range(N_BATCHES)]
-        v_values = [self.alloc_scratch(f"v_val_{b}", VLEN) for b in range(N_BATCHES)]
-        v_node_vals = [self.alloc_scratch(f"v_node_val_{b}", VLEN) for b in range(N_BATCHES)]
-        
-        # Temporary registers (one set per batch, reuse node_vals for tmp3)
-        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{b}", VLEN) for b in range(N_BATCHES)]
-        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{b}", VLEN) for b in range(N_BATCHES)]
-        v_tmp3 = v_node_vals # Reuse node_vals scratch for tmp3 after it's used
-        
-        # 0. Initial load from memory
-        for b in range(N_BATCHES):
-            i = b * VLEN
-            self.add("load", ("vload", v_indices[b], batch_addr_idx_map[i]))
-            self.add("load", ("vload", v_values[b], batch_addr_val_map[i]))
+        for b in range(batch_size // VLEN):
+            self.add("load", ("vload", v_idx[b], ba_idx[b]))
+            self.add("load", ("vload", v_val[b], ba_val[b]))
 
         for round in range(rounds):
-            # 1. Address calculations and Loads for ALL batches
-            # Use ALU for address calculation to free up VALU slots
-            for b in range(N_BATCHES):
+            for b in range(batch_size // VLEN):
                 for vi in range(VLEN):
-                    self.add("alu", ("+", v_tmp1[b] + vi, v_indices[b] + vi, self.scratch["forest_values_p"]))
+                    self.add("alu", ("+", v_t1[b] + vi, v_idx[b] + vi, self.scratch["forest_values_p"]))
                 for vi in range(VLEN):
-                    self.add("load", ("load", v_node_vals[b] + vi, v_tmp1[b] + vi))
-
-            # 2. Hash calculation for ALL batches
-            for b in range(N_BATCHES):
-                self.add("valu", ("^", v_values[b], v_values[b], v_node_vals[b]))
-
-            for hi in range(len(HASH_STAGES)):
-                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
-                v_c1 = v_c1_map[hi]
-                v_c3 = v_c3_map[hi]
+                    self.add("load", ("load", v_nv[b] + vi, v_t1[b] + vi))
                 
-                # Part 1: First two ops for all batches
-                for b in range(N_BATCHES):
-                    self.add("valu", (op1, v_tmp1[b], v_values[b], v_c1))
-                    self.add("valu", (op3, v_tmp2[b], v_values[b], v_c3))
+                self.add("valu", ("^", v_val[b], v_val[b], v_nv[b]))
+                for op1, val1, op2, op3, val3 in HASH_STAGES:
+                    self.add("valu", (op1, v_t1[b], v_val[b], self.scratch_const(val1)))
+                    self.add("valu", (op3, v_t2[b], v_val[b], self.scratch_const(val3)))
+                    self.add("valu", (op2, v_val[b], v_t1[b], v_t2[b]))
                 
-                # Part 2: Third op for all batches
-                for b in range(N_BATCHES):
-                    self.add("valu", (op2, v_values[b], v_tmp1[b], v_tmp2[b]))
+                self.add("valu", ("&", v_t1[b], v_val[b], v_one))
+                self.add("valu", ("+", v_t1[b], v_t1[b], v_one))
+                self.add("valu", ("multiply_add", v_idx[b], v_idx[b], v_two, v_t1[b]))
+                self.add("valu", ("<", v_t1[b], v_idx[b], v_nn))
+                self.add("valu", ("*", v_idx[b], v_idx[b], v_t1[b]))
+            self.add("flow", ("pause",))
 
-            # 3. Update indices and Wrap for ALL batches
-            for b in range(N_BATCHES):
-                self.add("valu", ("%", v_tmp1[b], v_values[b], v_two))
-                self.add("valu", ("==", v_tmp1[b], v_tmp1[b], v_zero))
-                # Now we can reuse v_node_vals[b] as v_tmp3[b]
-                self.add("flow", ("vselect", v_tmp3[b], v_tmp1[b], v_one, v_two))
-                self.add("valu", ("*", v_indices[b], v_indices[b], v_two))
-                self.add("valu", ("+", v_indices[b], v_indices[b], v_tmp3[b]))
-                self.add("valu", ("<", v_tmp1[b], v_indices[b], v_n_nodes))
-                self.add("flow", ("vselect", v_indices[b], v_tmp1[b], v_indices[b], v_zero))
+        for b in range(batch_size // VLEN):
+            self.add("store", ("vstore", ba_idx[b], v_idx[b]))
+            self.add("store", ("vstore", ba_val[b], v_val[b]))
 
-        # 3. Final store to memory
-        for b in range(N_BATCHES):
-            i = b * VLEN
-            self.add("store", ("vstore", batch_addr_idx_map[i], v_indices[b]))
-            self.add("store", ("vstore", batch_addr_val_map[i], v_values[b]))
-
-        self.add("flow", ("pause",))
         self.instrs = self.build(self.raw_slots, vliw=True)
         self.raw_slots = []
 
