@@ -306,59 +306,67 @@ class KernelBuilder:
         tmp_addr_idx = self.alloc_scratch("tmp_addr_idx")
         tmp_addr_val = self.alloc_scratch("tmp_addr_val")
         
-        # We'll use 4 batches of vector registers to overlap operations
-        N_OVERLAP = 4
-        v_indices = [self.alloc_scratch(f"v_idx_{b}", VLEN) for b in range(N_OVERLAP)]
-        v_values = [self.alloc_scratch(f"v_val_{b}", VLEN) for b in range(N_OVERLAP)]
-        v_node_vals = [self.alloc_scratch(f"v_node_val_{b}", VLEN) for b in range(N_OVERLAP)]
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        # Process all sub-batches with maximum interleaving
+        N_BATCHES = batch_size // VLEN
+        v_indices = [self.alloc_scratch(f"v_idx_{b}", VLEN) for b in range(N_BATCHES)]
+        v_values = [self.alloc_scratch(f"v_val_{b}", VLEN) for b in range(N_BATCHES)]
+        v_node_vals = [self.alloc_scratch(f"v_node_val_{b}", VLEN) for b in range(N_BATCHES)]
         
-        tmp_node_addrs = [[self.alloc_scratch(f"tmp_node_addr_{b}_{vi}") for vi in range(VLEN)] for b in range(N_OVERLAP)]
+        # Temporary registers for hashing (we need a few sets to allow interleaving)
+        N_TEMP = 4
+        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{t}", VLEN) for t in range(N_TEMP)]
+        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{t}", VLEN) for t in range(N_TEMP)]
+        v_tmp3 = [self.alloc_scratch(f"v_tmp3_{t}", VLEN) for t in range(N_TEMP)]
+        
+        tmp_node_addrs = [[self.alloc_scratch(f"tmp_node_addr_{b}_{vi}") for vi in range(VLEN)] for b in range(N_BATCHES)]
 
-        for i_base in range(0, batch_size, N_OVERLAP * VLEN):
-            # 0. Initial load from memory
-            for b in range(N_OVERLAP):
-                i = i_base + b * VLEN
-                self.add("load", ("vload", v_indices[b], batch_addr_idx_map[i]))
-                self.add("load", ("vload", v_values[b], batch_addr_val_map[i]))
+        # 0. Initial load from memory
+        for b in range(N_BATCHES):
+            i = b * VLEN
+            self.add("load", ("vload", v_indices[b], batch_addr_idx_map[i]))
+            self.add("load", ("vload", v_values[b], batch_addr_val_map[i]))
 
-            for round in range(rounds):
-                # 1. Load node values for all overlapped batches
-                for b in range(N_OVERLAP):
+        for round in range(rounds):
+            # We'll use a sliding window to interleave Loads, Hashes, and Updates
+            # Window size of 8 batches
+            W = 8
+            for b in range(N_BATCHES + W):
+                # 1. Start loads for batch b
+                if b < N_BATCHES:
                     for vi in range(VLEN):
                         self.add("alu", ("+", tmp_node_addrs[b][vi], self.scratch["forest_values_p"], v_indices[b] + vi))
-                
-                for b in range(N_OVERLAP):
                     for vi in range(VLEN):
                         self.add("load", ("load", v_node_vals[b] + vi, tmp_node_addrs[b][vi]))
-
-                # 2. Process each batch (hash and update)
-                for b in range(N_OVERLAP):
+                
+                # 2. Hash and update for batch b - W
+                if b >= W:
+                    pb = b - W
+                    # Use a temp set based on pb % N_TEMP
+                    t = pb % N_TEMP
+                    
                     # Hash
-                    self.add("valu", ("^", v_values[b], v_values[b], v_node_vals[b]))
+                    self.add("valu", ("^", v_values[pb], v_values[pb], v_node_vals[pb]))
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        self.add("valu", (op1, v_tmp1, v_values[b], v_c1_map[hi]))
-                        self.add("valu", (op3, v_tmp2, v_values[b], v_c3_map[hi]))
-                        self.add("valu", (op2, v_values[b], v_tmp1, v_tmp2))
+                        self.add("valu", (op1, v_tmp1[t], v_values[pb], v_c1_map[hi]))
+                        self.add("valu", (op3, v_tmp2[t], v_values[pb], v_c3_map[hi]))
+                        self.add("valu", (op2, v_values[pb], v_tmp1[t], v_tmp2[t]))
 
                     # Update Index
-                    self.add("valu", ("%", v_tmp1, v_values[b], v_two))
-                    self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
-                    self.add("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two))
-                    self.add("valu", ("*", v_indices[b], v_indices[b], v_two))
-                    self.add("valu", ("+", v_indices[b], v_indices[b], v_tmp3))
+                    self.add("valu", ("%", v_tmp1[t], v_values[pb], v_two))
+                    self.add("valu", ("==", v_tmp1[t], v_tmp1[t], v_zero))
+                    self.add("flow", ("vselect", v_tmp3[t], v_tmp1[t], v_one, v_two))
+                    self.add("valu", ("*", v_indices[pb], v_indices[pb], v_two))
+                    self.add("valu", ("+", v_indices[pb], v_indices[pb], v_tmp3[t]))
                     
                     # Wrap
-                    self.add("valu", ("<", v_tmp1, v_indices[b], v_n_nodes))
-                    self.add("flow", ("vselect", v_indices[b], v_tmp1, v_indices[b], v_zero))
+                    self.add("valu", ("<", v_tmp1[t], v_indices[pb], v_n_nodes))
+                    self.add("flow", ("vselect", v_indices[pb], v_tmp1[t], v_indices[pb], v_zero))
 
-            # 3. Final store to memory
-            for b in range(N_OVERLAP):
-                i = i_base + b * VLEN
-                self.add("store", ("vstore", batch_addr_idx_map[i], v_indices[b]))
-                self.add("store", ("vstore", batch_addr_val_map[i], v_values[b]))
+        # 3. Final store to memory
+        for b in range(N_BATCHES):
+            i = b * VLEN
+            self.add("store", ("vstore", batch_addr_idx_map[i], v_indices[b]))
+            self.add("store", ("vstore", batch_addr_val_map[i], v_values[b]))
 
         self.add("flow", ("pause",))
         self.instrs = self.build(self.raw_slots, vliw=True)
