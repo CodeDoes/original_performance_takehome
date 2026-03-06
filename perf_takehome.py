@@ -353,38 +353,6 @@ class KernelBuilder:
                             self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[ni]))
                             self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
                             self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], v_nv[ti]))
-                    elif curr_num == 8:
-                        # binary search mux for vdn[7..14]
-                        # layer 1: (7,8), (9,10), (11,12), (13,14) -> v_mx[0..3]
-                        # bit 0 chooses
-                        self.add("load", ("const", ts, 7))
-                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                        self.add("valu", ("==", v_mask, v_idx_p[b], v_t1[ti]))
-                        self.add("valu", ("-", v_t1[ti], vdn[7], vdn[8]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[8])) # mx0
-                        
-                        self.add("load", ("const", ts, 9))
-                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                        self.add("valu", ("==", v_mask, v_idx_p[b], v_t1[ti]))
-                        self.add("valu", ("-", v_t1[ti], vdn[9], vdn[10]))
-                        self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[10])) # mx1
-                        
-                        # mux between mx0 and mx1 using bit 1
-                        self.add("valu", ("<", v_mask, v_idx_p[b], self.scratch_const_vector(9)))
-                        self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti])) # v_nv is mux(7..10)
-                        
-                        # same for (11..14)
-                        # ... wait, I'm running out of registers.
-                        # Let's just use linear for 8 nodes but with 2 nodes at a time
-                        self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
-                        for i in range(curr_num - 1):
-                            ni = curr_start + i
-                            self.add("load", ("const", ts, ni))
-                            self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                            self.add("valu", ("==", v_mask, v_idx_p[b], v_t1[ti]))
-                            self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
-                            self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_nv[ti]))
                 else:
                     # Fallback to scalar loads but use VALU for address calc
                     self.add("valu", ("+", v_t1[ti], v_idx_p[b], v_forest_p))
