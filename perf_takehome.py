@@ -278,6 +278,18 @@ class KernelBuilder:
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
 
+        # Pre-calculate batch addresses
+        batch_addr_idx_map = {}
+        batch_addr_val_map = {}
+        for i in range(0, batch_size, VLEN):
+            i_const = self.scratch_const(i)
+            addr_idx = self.alloc_scratch(f"batch_addr_idx_{i}")
+            addr_val = self.alloc_scratch(f"batch_addr_val_{i}")
+            self.add("alu", ("+", addr_idx, self.scratch["inp_indices_p"], i_const))
+            self.add("alu", ("+", addr_val, self.scratch["inp_values_p"], i_const))
+            batch_addr_idx_map[i] = addr_idx
+            batch_addr_val_map[i] = addr_val
+
         # Preamble pause
         self.add("flow", ("pause",))
 
@@ -297,14 +309,9 @@ class KernelBuilder:
 
         for round in range(rounds):
             for i in range(0, batch_size, VLEN):
-                i_const = self.scratch_const(i)
-                
                 # 1. Load indices and values for the batch
-                self.add("alu", ("+", tmp_addr_idx, self.scratch["inp_indices_p"], i_const))
-                self.add("alu", ("+", tmp_addr_val, self.scratch["inp_values_p"], i_const))
-                
-                self.add("load", ("vload", v_idx, tmp_addr_idx))
-                self.add("load", ("vload", v_val, tmp_addr_val))
+                self.add("load", ("vload", v_idx, batch_addr_idx_map[i]))
+                self.add("load", ("vload", v_val, batch_addr_val_map[i]))
                 
                 # Debug compare (vectorized)
                 self.add("debug", ("vcompare", v_idx, [(round, i + vi, "idx") for vi in range(VLEN)]))
@@ -348,8 +355,8 @@ class KernelBuilder:
                 self.add("debug", ("vcompare", v_idx, [(round, i + vi, "wrapped_idx") for vi in range(VLEN)]))
 
                 # 6. Store indices and values
-                self.add("store", ("vstore", tmp_addr_idx, v_idx))
-                self.add("store", ("vstore", tmp_addr_val, v_val))
+                self.add("store", ("vstore", batch_addr_idx_map[i], v_idx))
+                self.add("store", ("vstore", batch_addr_val_map[i], v_val))
 
         self.add("flow", ("pause",))
         self.instrs = self.build(self.raw_slots, vliw=True)
