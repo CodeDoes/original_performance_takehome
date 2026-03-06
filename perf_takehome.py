@@ -284,8 +284,8 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-4 (31 nodes)
-        MAX_OPTIMIZED_DEPTH = 4
+        # Optimized layers 0-2 (7 nodes)
+        MAX_OPTIMIZED_DEPTH = 2
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
@@ -295,11 +295,10 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (6 sets for interleaving)
-        N_TEMPS = 6
-        # Allocate 6 registers per set to support binary mux up to Depth 4
+        # Temp registers (16 sets for interleaving)
+        N_TEMPS = 16
         # v_regs[ti][0] will be the result/accumulator (v_nv)
-        v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(6)] for i in range(N_TEMPS)]
+        v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(3)] for i in range(N_TEMPS)]
 
         # Initial Load
         ts_addr = self.alloc_scratch("ts_addr")
@@ -309,7 +308,7 @@ class KernelBuilder:
             self.add("alu", ("+", ts_addr, self.scratch["inp_values_p"], self.scratch_const(b * VLEN)))
             self.add("load", ("vload", v_val_p[b], ts_addr))
 
-        # Pre-load nodes for Level 0-4
+        # Pre-load nodes for Level 0-2
         for ni in range(N_OPTIMIZED_NODES):
             self.add("alu", ("+", ts, self.scratch["forest_values_p"], self.scratch_const(ni)))
             self.add("load", ("load", ts_node, ts))
@@ -319,42 +318,54 @@ class KernelBuilder:
             """
             Recursive binary mux.
             regs_indices: list of available register indices in v_regs[ti].
-            Returns the register index containing the result.
+            Returns either a register index (int) or a vdn index tuple ("vdn", idx).
             """
             if count == 1:
-                # Move constant to register
-                res_reg = v_regs[ti][regs_indices[0]]
-                # vdn is preloaded, just move it? 
-                # Or just add 0. vdn is a vector address.
-                self.add("valu", ("+", res_reg, vdn[start_idx], v_zero))
-                return regs_indices[0]
+                return ("vdn", start_idx)
             
             mid = start_idx + count // 2
             
             # Recurse
-            # Split registers. Need enough for both? 
-            # We computed max depth needed is 5. We have 6.
-            # We can reuse registers from left for right, except the result of left.
+            left_res = build_mux(start_idx, count // 2, regs_indices)
             
-            left_reg_idx = build_mux(start_idx, count // 2, regs_indices)
+            # Use remaining registers
+            # If left used a register, we should exclude it.
+            # But with optimized leaf, we might not use registers at bottom.
+            # If left returns a reg, that reg is occupied.
             
-            # For right side, we can't use left_reg_idx.
-            remaining_regs = [r for r in regs_indices if r != left_reg_idx]
-            right_reg_idx = build_mux(mid, count // 2, remaining_regs)
+            remaining_regs = list(regs_indices)
+            if isinstance(left_res, int):
+                remaining_regs.remove(left_res)
             
-            res_reg = v_regs[ti][left_reg_idx]
-            other_reg = v_regs[ti][right_reg_idx]
-            mask_reg = v_regs[ti][5] # Use the last register as mask
+            right_res = build_mux(mid, count // 2, remaining_regs)
+            
+            # Allocate result register
+            if isinstance(left_res, int):
+                res_reg = v_regs[ti][left_res]
+                res_idx = left_res
+            else:
+                # Alloc new reg
+                res_idx = remaining_regs[0]
+                res_reg = v_regs[ti][res_idx]
+                
+            mask_reg = v_regs[ti][2] # Use the last register as mask (v_regs has 3 regs: 0, 1, 2)
+            # Wait, if we recurse deep, we might need more?
+            # Max depth 2 (4 items).
+            # L(2) -> reg 0. R(2) -> reg 1. Comb -> reg 0.
+            # L(2): L(1)->vdn, R(1)->vdn. Comb -> reg 0.
+            # So we need reg 0 and reg 1.
+            # v_regs has 3 regs. Safe.
+            
+            # Resolve operands
+            left_op = vdn[left_res[1]] if isinstance(left_res, tuple) else v_regs[ti][left_res]
+            right_op = vdn[right_res[1]] if isinstance(right_res, tuple) else v_regs[ti][right_res]
             
             # Mux logic: res = (idx < mid) ? left : right
-            # res = mask * (left - right) + right
-            # where mask = (idx < mid)
-            
             self.add("valu", ("<", mask_reg, v_idx_p[b], v_const_idx[mid]))
-            self.add("valu", ("-", res_reg, res_reg, other_reg)) # left = left - right
-            self.add("valu", ("multiply_add", res_reg, mask_reg, res_reg, other_reg))
+            self.add("valu", ("-", res_reg, left_op, right_op)) # res = left - right
+            self.add("valu", ("multiply_add", res_reg, mask_reg, res_reg, right_op))
             
-            return left_reg_idx
+            return res_idx
 
         for round in range(rounds):
             level = round % (forest_height + 1)
@@ -364,10 +375,14 @@ class KernelBuilder:
                 if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
-                    # Use registers 0..4 for data, 5 for mask
-                    build_mux(curr_start, curr_num, [0, 1, 2, 3, 4])
-                    # Result is in v_regs[ti][0]
-                    v_node_val = v_regs[ti][0]
+                    # Use registers 0, 1 for data, 2 for mask
+                    res = build_mux(curr_start, curr_num, [0, 1])
+                    if isinstance(res, tuple):
+                         # Just a single node, move to reg 0
+                         self.add("valu", ("+", v_regs[ti][0], vdn[res[1]], v_zero))
+                         v_node_val = v_regs[ti][0]
+                    else:
+                         v_node_val = v_regs[ti][res]
                 else:
                     # Fallback to scalar loads
                     v_node_val = v_regs[ti][0]
@@ -390,12 +405,6 @@ class KernelBuilder:
                 self.add("valu", ("+", v_t1, v_t1, v_one))
                 self.add("valu", ("multiply_add", v_idx_p[b], v_idx_p[b], v_two, v_t1))
                 
-                # Bounds check (optional? "Updating the current index based on the lower bit...").
-                # Original code had:
-                # self.add("valu", ("<", v_t1[ti], v_idx_p[b], v_nn))
-                # self.add("valu", ("*", v_idx_p[b], v_idx_p[b], v_t1[ti]))
-                # This resets index if it exceeds n_nodes?
-                # The problem statement doesn't explicitly say to reset, but safe to keep.
                 self.add("valu", ("<", v_t1, v_idx_p[b], v_nn))
                 self.add("valu", ("*", v_idx_p[b], v_idx_p[b], v_t1))
 
