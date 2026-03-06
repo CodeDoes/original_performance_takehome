@@ -243,31 +243,11 @@ class KernelBuilder:
             self.const_map[(val, "vector")] = addr
         return self.const_map[(val, "vector")]
 
-    def build_hash_vector(self, v_val, v_t1, v_t2):
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            if op1 == "+" and op2 == "+" and op3 == "<<":
-                multiplier = (1 << val3) + 1
-                v_mul = self.scratch_const_vector(multiplier)
-                v_add = self.scratch_const_vector(val1)
-                self.add("valu", ("multiply_add", v_val, v_val, v_mul, v_add))
-            elif op1 == "+" and op2 == "^" and op3 == "<<":
-                v_one_vec = self.scratch_const_vector(1)
-                v_val1 = self.scratch_const_vector(val1)
-                self.add("valu", ("multiply_add", v_t1, v_val, v_one_vec, v_val1))
-                self.add("valu", (op3, v_t2, v_val, self.scratch_const_vector(val3)))
-                self.add("valu", (op2, v_val, v_t1, v_t2))
-            else:
-                v_val1 = self.scratch_const_vector(val1)
-                v_val3 = self.scratch_const_vector(val3)
-                self.add("valu", (op1, v_t1, v_val, v_val1))
-                self.add("valu", (op3, v_t2, v_val, v_val3))
-                self.add("valu", (op2, v_val, v_t1, v_t2))
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized implementation.
+        Optimized implementation following PLAN.md.
         """
         init_vars = ["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars: self.alloc_scratch(v, 1)
@@ -292,80 +272,131 @@ class KernelBuilder:
         v_const_idx = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)]
         
         # Persistent state for 32 batches
-        v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
-        v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
+        n_batches = batch_size // VLEN
+        v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(n_batches)]
+        v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(n_batches)]
         
-        # Temp registers (16 sets for interleaving)
-        N_TEMPS = 16
+        # Temp registers (8 sets for interleaving as per PLAN.md)
+        N_TEMPS = 8
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
         v_mask = self.alloc_scratch("v_mask", VLEN)
+        v_mask2 = self.alloc_scratch("v_mask2", VLEN)
 
         # Initial Load
         ts_addr = self.alloc_scratch("ts_addr")
-        for b in range(batch_size // VLEN):
+        for b in range(n_batches):
             self.add("alu", ("+", ts_addr, self.scratch["inp_indices_p"], self.scratch_const(b * VLEN)))
             self.add("load", ("vload", v_idx_p[b], ts_addr))
             self.add("alu", ("+", ts_addr, self.scratch["inp_values_p"], self.scratch_const(b * VLEN)))
             self.add("load", ("vload", v_val_p[b], ts_addr))
 
-        # Pre-load nodes for Level 0-4
+        # Pre-load nodes for Level 0-3
         for ni in range(N_OPTIMIZED_NODES):
             self.add("alu", ("+", ts, self.scratch["forest_values_p"], self.scratch_const(ni)))
             self.add("load", ("load", ts_node, ts))
             self.add("valu", ("vbroadcast", vdn[ni], ts_node))
 
+        # Pre-allocate hash constants
+        hash_consts = {}
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                hash_consts[(hi, "mul")] = self.scratch_const_vector((1 << val3) + 1)
+                hash_consts[(hi, "add")] = self.scratch_const_vector(val1)
+            else:
+                hash_consts[(hi, "c1")] = self.scratch_const_vector(val1)
+                hash_consts[(hi, "c3")] = self.scratch_const_vector(val3)
+
         for round in range(rounds):
             level = round % (forest_height + 1)
-            for b in range(batch_size // VLEN):
+            
+            # 1. Selection Phase (Interleaved)
+            for b in range(n_batches):
                 ti = b % N_TEMPS
-                
-                if level <= MAX_OPTIMIZED_DEPTH:
-                    curr_start = (1 << level) - 1
-                    curr_num = 1 << level
-                    if curr_num == 1:
-                        self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
-                    elif curr_num == 2:
-                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[1]))
-                        self.add("valu", ("-", v_t1[ti], vdn[1], vdn[2]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[2]))
-                    elif curr_num == 4:
-                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[3]))
-                        self.add("valu", ("-", v_t1[ti], vdn[3], vdn[4]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[4]))
-                        
-                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[5]))
-                        self.add("valu", ("-", v_t1[ti], vdn[5], vdn[6]))
-                        self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[6]))
-                        
-                        self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[5]))
-                        self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
-                    else:
-                        # Linear search mux
-                        self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
-                        for i in range(curr_num - 1):
-                            ni = curr_start + i
-                            self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[ni]))
-                            self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
-                            self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_nv[ti]))
+                if level == 0:
+                    self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
+                elif level == 1:
+                    # Mux nodes 1, 2
+                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[1]))
+                    self.add("valu", ("-", v_t1[ti], vdn[1], vdn[2]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[2]))
+                elif level == 2:
+                    # Mux nodes 3, 4, 5, 6
+                    # Left: 3 vs 4
+                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[3]))
+                    self.add("valu", ("-", v_t1[ti], vdn[3], vdn[4]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[4]))
+                    # Right: 5 vs 6
+                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[5]))
+                    self.add("valu", ("-", v_t1[ti], vdn[5], vdn[6]))
+                    self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[6]))
+                    # Final mux
+                    self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[5]))
+                    self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
+                elif level == 3:
+                    # Mux nodes 7-14 (Binary search)
+                    # 7-8
+                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[7]))
+                    self.add("valu", ("-", v_t1[ti], vdn[7], vdn[8]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[8]))
+                    # 9-10
+                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[9]))
+                    self.add("valu", ("-", v_t1[ti], vdn[9], vdn[10]))
+                    self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[10]))
+                    # 7-10
+                    self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[9]))
+                    self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
+                    
+                    # 11-12
+                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[11]))
+                    self.add("valu", ("-", v_t1[ti], vdn[11], vdn[12]))
+                    self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[12]))
+                    # 13-14
+                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[13]))
+                    self.add("valu", ("-", v_t1[ti], vdn[13], vdn[14]))
+                    self.add("valu", ("multiply_add", v_mask2, v_mask, v_t1[ti], vdn[14])) # Use mask2 temporarily
+                    # 11-14
+                    self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[13]))
+                    self.add("valu", ("-", v_t1[ti], v_t2[ti], v_mask2))
+                    self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], v_mask2))
+                    
+                    # Final 7-14
+                    self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[11]))
+                    self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
                 else:
-                    # Fallback to scalar loads
+                    # Scalar loads for Level 4-10
                     self.add("valu", ("+", v_t1[ti], v_idx_p[b], v_forest_p))
                     for vi in range(VLEN):
                         self.add("load", ("load", v_nv[ti] + vi, v_t1[ti] + vi))
 
-                # Hash
+            # 2. Hash Phase (Interleaved stages)
+            for b in range(n_batches):
+                ti = b % N_TEMPS
                 self.add("valu", ("^", v_val_p[b], v_val_p[b], v_nv[ti]))
-                self.build_hash_vector(v_val_p[b], v_t1[ti], v_t2[ti])
-                
-                # Update
+
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                for b in range(n_batches):
+                    ti = b % N_TEMPS
+                    if op1 == "+" and op2 == "+" and op3 == "<<":
+                        self.add("valu", ("multiply_add", v_val_p[b], v_val_p[b], hash_consts[(hi, "mul")], hash_consts[(hi, "add")]))
+                    else:
+                        self.add("valu", (op1, v_t1[ti], v_val_p[b], hash_consts[(hi, "c1")]))
+                        self.add("valu", (op3, v_t2[ti], v_val_p[b], hash_consts[(hi, "c3")]))
+                        self.add("valu", (op2, v_val_p[b], v_t1[ti], v_t2[ti]))
+
+            # 3. Update Phase (Interleaved)
+            for b in range(n_batches):
+                ti = b % N_TEMPS
                 self.add("valu", ("&", v_t1[ti], v_val_p[b], v_one))
                 self.add("valu", ("+", v_t1[ti], v_t1[ti], v_one))
                 self.add("valu", ("multiply_add", v_idx_p[b], v_idx_p[b], v_two, v_t1[ti]))
                 self.add("valu", ("<", v_t1[ti], v_idx_p[b], v_nn))
                 self.add("valu", ("*", v_idx_p[b], v_idx_p[b], v_t1[ti]))
+
 
         # Final Store
         for b in range(batch_size // VLEN):
