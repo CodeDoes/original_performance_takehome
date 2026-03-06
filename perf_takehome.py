@@ -276,13 +276,13 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(n_batches)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(n_batches)]
         
-        # Temp registers (8 sets for interleaving as per PLAN.md)
-        N_TEMPS = 8
+        # Temp registers (16 sets for interleaving)
+        N_TEMPS = 16
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
-        v_mask = self.alloc_scratch("v_mask", VLEN)
-        v_mask2 = self.alloc_scratch("v_mask2", VLEN)
+        v_t3 = [self.alloc_scratch(f"vt3_{i}", VLEN) for i in range(N_TEMPS)]
+        v_t4 = [self.alloc_scratch(f"vt4_{i}", VLEN) for i in range(N_TEMPS)]
 
         # Initial Load
         ts_addr = self.alloc_scratch("ts_addr")
@@ -318,55 +318,55 @@ class KernelBuilder:
                     self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
                 elif level == 1:
                     # Mux nodes 1, 2
-                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[1]))
-                    self.add("valu", ("-", v_t1[ti], vdn[1], vdn[2]))
-                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[2]))
+                    self.add("valu", ("==", v_t1[ti], v_idx_p[b], v_const_idx[1]))
+                    self.add("valu", ("-", v_t2[ti], vdn[1], vdn[2]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_t1[ti], v_t2[ti], vdn[2]))
                 elif level == 2:
                     # Mux nodes 3, 4, 5, 6
                     # Left: 3 vs 4
-                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[3]))
-                    self.add("valu", ("-", v_t1[ti], vdn[3], vdn[4]))
-                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[4]))
+                    self.add("valu", ("==", v_t1[ti], v_idx_p[b], v_const_idx[3]))
+                    self.add("valu", ("-", v_t2[ti], vdn[3], vdn[4]))
+                    self.add("valu", ("multiply_add", v_t3[ti], v_t1[ti], v_t2[ti], vdn[4]))
                     # Right: 5 vs 6
-                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[5]))
-                    self.add("valu", ("-", v_t1[ti], vdn[5], vdn[6]))
-                    self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[6]))
+                    self.add("valu", ("==", v_t1[ti], v_idx_p[b], v_const_idx[5]))
+                    self.add("valu", ("-", v_t2[ti], vdn[5], vdn[6]))
+                    self.add("valu", ("multiply_add", v_t4[ti], v_t1[ti], v_t2[ti], vdn[6]))
                     # Final mux
-                    self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[5]))
-                    self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
-                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
+                    self.add("valu", ("<", v_t1[ti], v_idx_p[b], v_const_idx[5]))
+                    self.add("valu", ("-", v_t2[ti], v_t3[ti], v_t4[ti]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_t1[ti], v_t2[ti], v_t4[ti]))
                 elif level == 3:
                     # Mux nodes 7-14 (Binary search)
-                    # 7-8
-                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[7]))
-                    self.add("valu", ("-", v_t1[ti], vdn[7], vdn[8]))
-                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[8]))
-                    # 9-10
-                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[9]))
-                    self.add("valu", ("-", v_t1[ti], vdn[9], vdn[10]))
-                    self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[10]))
-                    # 7-10
-                    self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[9]))
-                    self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
-                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
+                    # 7 vs 8 -> t1
+                    self.add("valu", ("==", v_t1[ti], v_idx_p[b], v_const_idx[7]))
+                    self.add("valu", ("-", v_t2[ti], vdn[7], vdn[8]))
+                    self.add("valu", ("multiply_add", v_t3[ti], v_t1[ti], v_t2[ti], vdn[8]))
+                    # 9 vs 10 -> t2
+                    self.add("valu", ("==", v_t1[ti], v_idx_p[b], v_const_idx[9]))
+                    self.add("valu", ("-", v_t2[ti], vdn[9], vdn[10]))
+                    self.add("valu", ("multiply_add", v_t4[ti], v_t1[ti], v_t2[ti], vdn[10]))
+                    # 7-10 -> t1
+                    self.add("valu", ("<", v_t1[ti], v_idx_p[b], v_const_idx[9]))
+                    self.add("valu", ("-", v_t2[ti], v_t3[ti], v_t4[ti]))
+                    self.add("valu", ("multiply_add", v_t1[ti], v_t1[ti], v_t2[ti], v_t4[ti]))
                     
-                    # 11-12
-                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[11]))
-                    self.add("valu", ("-", v_t1[ti], vdn[11], vdn[12]))
-                    self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[12]))
-                    # 13-14
-                    self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[13]))
-                    self.add("valu", ("-", v_t1[ti], vdn[13], vdn[14]))
-                    self.add("valu", ("multiply_add", v_mask2, v_mask, v_t1[ti], vdn[14])) # Use mask2 temporarily
-                    # 11-14
-                    self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[13]))
-                    self.add("valu", ("-", v_t1[ti], v_t2[ti], v_mask2))
-                    self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], v_mask2))
+                    # 11 vs 12 -> t2
+                    self.add("valu", ("==", v_t2[ti], v_idx_p[b], v_const_idx[11]))
+                    self.add("valu", ("-", v_t3[ti], vdn[11], vdn[12]))
+                    self.add("valu", ("multiply_add", v_t4[ti], v_t2[ti], v_t3[ti], vdn[12]))
+                    # 13 vs 14 -> t3
+                    self.add("valu", ("==", v_t2[ti], v_idx_p[b], v_const_idx[13]))
+                    self.add("valu", ("-", v_t3[ti], vdn[13], vdn[14]))
+                    self.add("valu", ("multiply_add", v_t2[ti], v_t2[ti], v_t3[ti], vdn[14])) # t2 now holds 13-14
+                    # 11-14 -> t2
+                    self.add("valu", ("<", v_t3[ti], v_idx_p[b], v_const_idx[13]))
+                    self.add("valu", ("-", v_t4[ti], v_t4[ti], v_t2[ti]))
+                    self.add("valu", ("multiply_add", v_t2[ti], v_t3[ti], v_t4[ti], v_t2[ti]))
                     
-                    # Final 7-14
-                    self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[11]))
-                    self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
-                    self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
+                    # Final 7-14 -> nv
+                    self.add("valu", ("<", v_t3[ti], v_idx_p[b], v_const_idx[11]))
+                    self.add("valu", ("-", v_t4[ti], v_t1[ti], v_t2[ti]))
+                    self.add("valu", ("multiply_add", v_nv[ti], v_t3[ti], v_t4[ti], v_t2[ti]))
                 else:
                     # Scalar loads for Level 4-10
                     self.add("valu", ("+", v_t1[ti], v_idx_p[b], v_forest_p))
