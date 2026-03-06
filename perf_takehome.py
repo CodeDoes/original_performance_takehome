@@ -37,10 +37,10 @@ from problem import (
 )
 
 # Configuration Flags
-MAX_OPTIMIZED_DEPTH = 2      # Depth 2 (3 levels Mux) is optimal due to Mux vs Load trade-off
-N_TEMPS = 30                 # Maximize batches to hide latency (fits in space with Depth 2)
-USE_VSELECT_MUX = True       # Use flow engine for Mux to offload Valu
-USE_DYNAMIC_CONSTANTS = False # Cached constants are faster (Valu bound)
+MAX_OPTIMIZED_DEPTH = 3      # Depth 3 (15 nodes)
+N_TEMPS = 24                 # Fits in space with Depth 3
+USE_VSELECT_MUX = True       # Use flow engine for leaves (Mixed Mux)
+USE_DYNAMIC_CONSTANTS = False # Cached constants are faster
 
 class KernelBuilder:
     def __init__(self):
@@ -374,7 +374,7 @@ class KernelBuilder:
             else:
                 self.add("valu", ("<", mask_reg, v_idx_p[b], self.scratch_const_vector(mid)))
             
-            if USE_VSELECT_MUX:
+            if USE_VSELECT_MUX and count == 2:
                 self.add("flow", ("vselect", res_reg, mask_reg, left_op, right_op))
             else:
                 self.add("valu", ("-", res_reg, left_op, right_op))
