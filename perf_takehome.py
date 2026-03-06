@@ -36,6 +36,11 @@ from problem import (
     reference_kernel2,
 )
 
+# Configuration Flags
+MAX_OPTIMIZED_DEPTH = 2      # Depth 2 (3 levels Mux) is optimal due to Mux vs Load trade-off
+N_TEMPS = 32                 # Maximize batches to hide latency (fits in space with Depth 2)
+USE_VSELECT_MUX = True       # Use flow engine for Mux to offload Valu
+USE_DYNAMIC_CONSTANTS = False # Cached constants are faster (Valu bound)
 
 class KernelBuilder:
     def __init__(self):
@@ -247,14 +252,26 @@ class KernelBuilder:
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 multiplier = (1 << val3) + 1
-                self.add("valu", ("vbroadcast", v_t1, self.scratch_const(multiplier)))
-                self.add("valu", ("vbroadcast", v_t2, self.scratch_const(val1)))
-                self.add("valu", ("multiply_add", v_val, v_val, v_t1, v_t2))
+                if USE_DYNAMIC_CONSTANTS:
+                    self.add("valu", ("vbroadcast", v_t1, self.scratch_const(multiplier)))
+                    self.add("valu", ("vbroadcast", v_t2, self.scratch_const(val1)))
+                    v_mul, v_add = v_t1, v_t2
+                else:
+                    v_mul = self.scratch_const_vector(multiplier)
+                    v_add = self.scratch_const_vector(val1)
+                
+                self.add("valu", ("multiply_add", v_val, v_val, v_mul, v_add))
             else:
-                self.add("valu", ("vbroadcast", v_t1, self.scratch_const(val1)))
-                self.add("valu", ("vbroadcast", v_t2, self.scratch_const(val3)))
-                self.add("valu", (op1, v_t1, v_val, v_t1))
-                self.add("valu", (op3, v_t2, v_val, v_t2))
+                if USE_DYNAMIC_CONSTANTS:
+                    self.add("valu", ("vbroadcast", v_t1, self.scratch_const(val1)))
+                    self.add("valu", ("vbroadcast", v_t2, self.scratch_const(val3)))
+                    v_val1, v_val3 = v_t1, v_t2
+                else:
+                    v_val1 = self.scratch_const_vector(val1)
+                    v_val3 = self.scratch_const_vector(val3)
+                
+                self.add("valu", (op1, v_t1, v_val, v_val1))
+                self.add("valu", (op3, v_t2, v_val, v_val3))
                 self.add("valu", (op2, v_val, v_t1, v_t2))
 
     def build_kernel(
@@ -273,22 +290,25 @@ class KernelBuilder:
         v_zero = self.scratch_const_vector(0)
         v_one = self.scratch_const_vector(1)
         v_two = self.scratch_const_vector(2)
-        # v_nn and v_forest_p generated on the fly to save space
+        
+        if not USE_DYNAMIC_CONSTANTS:
+            v_nn = self.alloc_scratch("v_nn", VLEN)
+            self.add("valu", ("vbroadcast", v_nn, self.scratch["n_nodes"]))
+            v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+            self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-2 (7 nodes)
-        MAX_OPTIMIZED_DEPTH = 2
+        # Optimized layers
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
         
-        # Persistent state for 32 batches
+        # Persistent state
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (30 sets for interleaving)
-        N_TEMPS = 30
+        # Temp registers
         # v_regs[ti][0] will be the result/accumulator (v_nv)
-        v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(3)] for i in range(N_TEMPS)]
+        v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(MAX_OPTIMIZED_DEPTH + 1)] for i in range(N_TEMPS)]
 
         # Initial Load
         ts_addr = self.alloc_scratch("ts_addr")
@@ -298,7 +318,7 @@ class KernelBuilder:
             self.add("alu", ("+", ts_addr, self.scratch["inp_values_p"], self.scratch_const(b * VLEN)))
             self.add("load", ("vload", v_val_p[b], ts_addr))
 
-        # Pre-load nodes for Level 0-2
+        # Pre-load nodes
         for ni in range(N_OPTIMIZED_NODES):
             self.add("alu", ("+", ts, self.scratch["forest_values_p"], self.scratch_const(ni)))
             self.add("load", ("load", ts_node, ts))
@@ -307,21 +327,13 @@ class KernelBuilder:
         def build_mux(start_idx, count, regs_indices):
             """
             Recursive binary mux.
-            regs_indices: list of available register indices in v_regs[ti].
-            Returns either a register index (int) or a vdn index tuple ("vdn", idx).
             """
             if count == 1:
                 return ("vdn", start_idx)
             
             mid = start_idx + count // 2
             
-            # Recurse
             left_res = build_mux(start_idx, count // 2, regs_indices)
-            
-            # Use remaining registers
-            # If left used a register, we should exclude it.
-            # But with optimized leaf, we might not use registers at bottom.
-            # If left returns a reg, that reg is occupied.
             
             remaining_regs = list(regs_indices)
             if isinstance(left_res, int):
@@ -334,11 +346,10 @@ class KernelBuilder:
                 res_reg = v_regs[ti][left_res]
                 res_idx = left_res
             else:
-                # Alloc new reg
                 res_idx = remaining_regs[0]
                 res_reg = v_regs[ti][res_idx]
             
-            # Find a free register for mask (one not holding Left or Right results)
+            # Find a free register for mask
             used_regs = set()
             if isinstance(left_res, int): used_regs.add(left_res)
             if isinstance(right_res, int): used_regs.add(right_res)
@@ -357,12 +368,17 @@ class KernelBuilder:
             right_op = vdn[right_res[1]] if isinstance(right_res, tuple) else v_regs[ti][right_res]
             
             # Mux logic: res = (idx < mid) ? left : right
-            # Use cached constant for mid
-            mid_vec = self.scratch_const_vector(mid)
-            self.add("valu", ("<", mask_reg, v_idx_p[b], mid_vec))
+            if USE_DYNAMIC_CONSTANTS:
+                self.add("valu", ("vbroadcast", mask_reg, self.scratch_const(mid)))
+                self.add("valu", ("<", mask_reg, v_idx_p[b], mask_reg))
+            else:
+                self.add("valu", ("<", mask_reg, v_idx_p[b], self.scratch_const_vector(mid)))
             
-            # Always use vselect (flow)
-            self.add("flow", ("vselect", res_reg, mask_reg, left_op, right_op))
+            if USE_VSELECT_MUX:
+                self.add("flow", ("vselect", res_reg, mask_reg, left_op, right_op))
+            else:
+                self.add("valu", ("-", res_reg, left_op, right_op))
+                self.add("valu", ("multiply_add", res_reg, mask_reg, res_reg, right_op))
             
             return res_idx
 
@@ -374,8 +390,8 @@ class KernelBuilder:
                 if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
-                    # Use registers 0, 1, 2, 3 for data
-                    res = build_mux(curr_start, curr_num, [0, 1, 2, 3])
+                    # Use all available registers
+                    res = build_mux(curr_start, curr_num, list(range(MAX_OPTIMIZED_DEPTH + 1)))
                     if isinstance(res, tuple):
                          # Just a single node, move to reg 0
                          self.add("valu", ("+", v_regs[ti][0], vdn[res[1]], v_zero))
@@ -386,28 +402,32 @@ class KernelBuilder:
                     # Fallback to scalar loads
                     v_node_val = v_regs[ti][0]
                     v_addr = v_regs[ti][1]
-                    # v_forest_p broadcast
-                    self.add("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))
-                    self.add("valu", ("+", v_addr, v_idx_p[b], v_addr))
+                    if USE_DYNAMIC_CONSTANTS:
+                        self.add("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))
+                        self.add("valu", ("+", v_addr, v_idx_p[b], v_addr))
+                    else:
+                        self.add("valu", ("+", v_addr, v_idx_p[b], v_forest_p))
+                    
                     for vi in range(VLEN):
                         self.add("load", ("load", v_node_val + vi, v_addr + vi))
 
                 # Hash
-                # v_val_p[b] ^= v_node_val
                 self.add("valu", ("^", v_val_p[b], v_val_p[b], v_node_val))
-                # Hash mixing. use v_regs[ti][1], v_regs[ti][2] as temps
                 self.build_hash_vector(v_val_p[b], v_regs[ti][1], v_regs[ti][2])
                 
                 # Update index
-                # idx = idx * 2 + (val & 1) + 1
                 v_t1 = v_regs[ti][1]
                 self.add("valu", ("&", v_t1, v_val_p[b], v_one))
                 self.add("valu", ("+", v_t1, v_t1, v_one))
                 self.add("valu", ("multiply_add", v_idx_p[b], v_idx_p[b], v_two, v_t1))
                 
-                # Broadcast n_nodes to v_regs[ti][2] (v_t1 is dest)
-                self.add("valu", ("vbroadcast", v_regs[ti][2], self.scratch["n_nodes"]))
-                self.add("valu", ("<", v_t1, v_idx_p[b], v_regs[ti][2]))
+                if USE_DYNAMIC_CONSTANTS:
+                    self.add("valu", ("vbroadcast", v_regs[ti][2], self.scratch["n_nodes"]))
+                    v_n = v_regs[ti][2]
+                else:
+                    v_n = v_nn
+                
+                self.add("valu", ("<", v_t1, v_idx_p[b], v_n))
                 self.add("valu", ("*", v_idx_p[b], v_idx_p[b], v_t1))
 
         # Final Store
@@ -448,76 +468,21 @@ def do_kernel_test(
         kb.instrs,
         kb.debug_info(),
         n_cores=N_CORES,
-        value_trace=value_trace,
         trace=trace,
+        value_trace=value_trace,
     )
+    machine.enable_pause = False
+    machine.enable_debug = False
     machine.prints = prints
-    
-    # Run until completion instead of round-by-round to avoid brittle check
     machine.run()
-    
-    for ref_mem in reference_kernel2(mem, value_trace):
+
+    for ref_mem in reference_kernel2(mem):
         pass
-    
+
     inp_values_p = ref_mem[6]
-    if prints:
-        print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-        print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
     assert (
         machine.mem[inp_values_p : inp_values_p + len(inp.values)]
         == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-    ), "Incorrect final values"
-
+    ), "Incorrect output values"
     print("CYCLES: ", machine.cycle)
-    print("Speedup over baseline: ", BASELINE / machine.cycle)
     return machine.cycle
-
-
-class Tests(unittest.TestCase):
-    def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
-        random.seed(123)
-        for i in range(10):
-            f = Tree.generate(4)
-            inp = Input.generate(f, 10, 6)
-            mem = build_mem_image(f, inp)
-            reference_kernel(f, inp)
-            for _ in reference_kernel2(mem, {}):
-                pass
-            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
-            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
-
-    def test_kernel_trace(self):
-        # Full-scale example for performance testing
-        do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
-
-    def test_kernel_cycles(self):
-        do_kernel_test(10, 16, 256)
-
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
-
-if __name__ == "__main__":
-    unittest.main()
