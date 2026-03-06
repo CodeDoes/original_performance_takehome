@@ -250,6 +250,12 @@ class KernelBuilder:
                 v_mul = self.scratch_const_vector(multiplier)
                 v_add = self.scratch_const_vector(val1)
                 self.add("valu", ("multiply_add", v_val, v_val, v_mul, v_add))
+            elif op1 == "+" and op2 == "^" and op3 == "<<":
+                v_one_vec = self.scratch_const_vector(1)
+                v_val1 = self.scratch_const_vector(val1)
+                self.add("valu", ("multiply_add", v_t1, v_val, v_one_vec, v_val1))
+                self.add("valu", (op3, v_t2, v_val, self.scratch_const(val3)))
+                self.add("valu", (op2, v_val, v_t1, v_t2))
             else:
                 v_val1 = self.scratch_const_vector(val1)
                 v_val3 = self.scratch_const_vector(val3)
@@ -275,35 +281,23 @@ class KernelBuilder:
         v_two = self.scratch_const_vector(2)
         v_nn = self.alloc_scratch("v_nn", VLEN)
         self.add("valu", ("vbroadcast", v_nn, self.scratch["n_nodes"]))
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-2 (7 nodes)
-        MAX_OPTIMIZED_DEPTH = 2
+        # Optimized layers 0-4 (31 nodes)
+        MAX_OPTIMIZED_DEPTH = 4
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
-        nst = [self.alloc_scratch(f"nst_{i}") for i in range(N_OPTIMIZED_NODES)]
+        ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
-        vdd = [self.alloc_scratch(f"vdd_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
         
-        # Only need constants for the nodes we use in the optimized mux
-        # Level 1 uses idx 1. Level 2 uses idx 3, 5.
-        needed_cidx = [1, 3, 5]
-        v_cidx = {i: self.alloc_scratch(f"vci_{i}", VLEN) for i in needed_cidx}
-        for i in needed_cidx: self.add("valu", ("vbroadcast", v_cidx[i], self.scratch_const(i)))
-
-        # 4 batches per pass for temps to save space
-        N_TEMPS = 4
         # Persistent state
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
         # Temp registers (one set for the whole kernel)
+        N_TEMPS = 4
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
         v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(N_TEMPS)]
-        v_m1 = [self.alloc_scratch(f"vm1_{i}", VLEN) for i in range(N_TEMPS)]
-        v_m2 = [self.alloc_scratch(f"vm2_{i}", VLEN) for i in range(N_TEMPS)]
 
         ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
         ba_val = [self.alloc_scratch(f"bav_{i}") for i in range(0, batch_size, VLEN)]
@@ -317,51 +311,26 @@ class KernelBuilder:
             self.add("load", ("vload", v_val_p[b], ba_val[b]))
 
         # Pre-load nodes for Level 0-4
-        cached_nodes = {}; node_diffs = {}
-        for level in range(min(MAX_OPTIMIZED_DEPTH + 1, forest_height + 1)):
-            start = (1 << level) - 1; num = 1 << level
-            for i in range(num):
-                ni = start + i
-                self.add("alu", ("+", nst[ni], self.scratch["forest_values_p"], self.scratch_const(ni)))
-                self.add("load", ("load", nst[ni], nst[ni]))
-                self.add("valu", ("vbroadcast", vdn[ni], nst[ni]))
-                cached_nodes[(level, i)] = vdn[ni]
-            if level > 0:
-                for i in range(0, num, 2):
-                    self.add("valu", ("-", vdd[start + i], cached_nodes[(level, i)], cached_nodes[(level, i+1)]))
-                    node_diffs[(level, i)] = vdd[start + i]
+        for ni in range(N_OPTIMIZED_NODES):
+            self.add("alu", ("+", ts, self.scratch["forest_values_p"], self.scratch_const(ni)))
+            self.add("load", ("load", ts_node, ts))
+            self.add("valu", ("vbroadcast", vdn[ni], ts_node))
 
         for round in range(rounds):
             level = round % (forest_height + 1)
             for b in range(batch_size // VLEN):
-                ti = b % N_TEMPS # we process all 32 batches in one round loop
-                # This allows the scheduler to interleave them perfectly
+                ti = b % N_TEMPS
                 
                 if level <= MAX_OPTIMIZED_DEPTH:
-                    # Mux logic for 31 nodes is complex. 
-                    # We'll use a simpler bitwise check for the conditions.
-                    # node_val = tree[level][ (idx+1) & mask ]
-                    
-                    # For now, just stick to depth 2 mux + fallback
-                    if level == 0:
-                        self.add("valu", ("+", v_nv[ti], cached_nodes[(0, 0)], v_zero))
-                    elif level == 1:
-                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], v_cidx[1]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_ct[ti], node_diffs[(1, 0)], cached_nodes[(1, 1)]))
-                    elif level == 2:
-                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], v_cidx[3]))
-                        self.add("valu", ("multiply_add", v_m1[ti], v_ct[ti], node_diffs[(2, 0)], cached_nodes[(2, 1)]))
-                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], v_cidx[5]))
-                        self.add("valu", ("multiply_add", v_m2[ti], v_ct[ti], node_diffs[(2, 2)], cached_nodes[(2, 3)]))
-                        self.add("valu", ("<", v_ct[ti], v_idx_p[b], v_cidx[5]))
-                        self.add("valu", ("-", v_nv[ti], v_m1[ti], v_m2[ti]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_ct[ti], v_nv[ti], v_m2[ti]))
-                    else:
-                        # Depth 3/4 fallback
-                        for vi in range(VLEN):
-                            self.add("alu", ("+", v_t1[ti] + vi, v_idx_p[b] + vi, self.scratch["forest_values_p"]))
-                        for vi in range(VLEN):
-                            self.add("load", ("load", v_nv[ti] + vi, v_t1[ti] + vi))
+                    curr_start = (1 << level) - 1
+                    curr_num = 1 << level
+                    # Linear search mux: nv = node[end]; for i in range(start, end-1): nv = (idx==i) ? node[i] : nv
+                    self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
+                    for i in range(curr_num - 1):
+                        ni = curr_start + i
+                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], self.scratch_const_vector(ni)))
+                        self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_ct[ti], v_t1[ti], v_nv[ti]))
                 else:
                     for vi in range(VLEN):
                         self.add("alu", ("+", v_t1[ti] + vi, v_idx_p[b] + vi, self.scratch["forest_values_p"]))
@@ -378,6 +347,14 @@ class KernelBuilder:
                 self.add("valu", ("multiply_add", v_idx_p[b], v_idx_p[b], v_two, v_t1[ti]))
                 self.add("valu", ("<", v_t1[ti], v_idx_p[b], v_nn))
                 self.add("valu", ("*", v_idx_p[b], v_idx_p[b], v_t1[ti]))
+
+        # Final Store
+        for b in range(batch_size // VLEN):
+            self.add("store", ("vstore", ba_idx[b], v_idx_p[b]))
+            self.add("store", ("vstore", ba_val[b], v_val_p[b]))
+
+        self.instrs = self.build(self.raw_slots, vliw=True)
+        self.raw_slots = []
 
         # Final Store
         for b in range(batch_size // VLEN):
