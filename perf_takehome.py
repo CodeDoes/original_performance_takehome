@@ -276,8 +276,8 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(n_batches)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(n_batches)]
         
-        # Temp registers (16 sets for interleaving)
-        N_TEMPS = 16
+        # Temp registers (8 sets for interleaving as per PLAN.md)
+        N_TEMPS = 8
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
