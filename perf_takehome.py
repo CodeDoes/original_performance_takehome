@@ -382,7 +382,77 @@ class KernelBuilder:
             
             return res_idx
 
-        for round in range(rounds):
+        current_round = 0
+
+        # Round 0 Optimization: idx=0, use vdn[0] directly, simplified index update
+        if rounds > current_round and MAX_OPTIMIZED_DEPTH >= 0:
+            for b in range(batch_size // VLEN):
+                ti = b % N_TEMPS
+                # Hash directly with vdn[0] (skip load/mux/copy)
+                self.add("valu", ("^", v_val_p[b], v_val_p[b], vdn[0]))
+                self.build_hash_vector(v_val_p[b], v_regs[ti][1], v_regs[ti][2])
+                
+                # Update index: idx = 2*0 + (val&1) + 1 = (val&1) + 1
+                v_t1 = v_regs[ti][1]
+                self.add("valu", ("&", v_t1, v_val_p[b], v_one))
+                self.add("valu", ("+", v_idx_p[b], v_t1, v_one))
+            current_round += 1
+
+        # Round 1 Optimization: idx in [1, 2]. Select vdn[1] vs vdn[2]. Simplified update.
+        if rounds > current_round and MAX_OPTIMIZED_DEPTH >= 1:
+            for b in range(batch_size // VLEN):
+                ti = b % N_TEMPS
+                # Select node
+                mask_reg = v_regs[ti][2]
+                res_reg = v_regs[ti][0]
+                
+                if USE_DYNAMIC_CONSTANTS:
+                    self.add("valu", ("vbroadcast", mask_reg, self.scratch_const(2)))
+                    self.add("valu", ("<", mask_reg, v_idx_p[b], mask_reg))
+                else:
+                    self.add("valu", ("<", mask_reg, v_idx_p[b], v_two))
+                
+                if USE_VSELECT_MUX:
+                    self.add("flow", ("vselect", res_reg, mask_reg, vdn[1], vdn[2]))
+                else:
+                    self.add("valu", ("-", res_reg, vdn[1], vdn[2]))
+                    self.add("valu", ("multiply_add", res_reg, mask_reg, res_reg, vdn[2]))
+                
+                # Hash
+                self.add("valu", ("^", v_val_p[b], v_val_p[b], res_reg))
+                self.build_hash_vector(v_val_p[b], v_regs[ti][1], v_regs[ti][2])
+                
+                # Update index: idx = 2*idx + (val&1) + 1 (No wrap check)
+                v_t1 = v_regs[ti][1]
+                self.add("valu", ("&", v_t1, v_val_p[b], v_one))
+                self.add("valu", ("+", v_t1, v_t1, v_one))
+                self.add("valu", ("multiply_add", v_idx_p[b], v_idx_p[b], v_two, v_t1))
+            current_round += 1
+
+        # Round 2 Optimization: idx in [3..6]. Depth 2 Mux. Simplified update.
+        if rounds > current_round and MAX_OPTIMIZED_DEPTH >= 2:
+            for b in range(batch_size // VLEN):
+                ti = b % N_TEMPS
+                # Mux 3..6
+                res = build_mux(3, 4, list(range(MAX_OPTIMIZED_DEPTH + 1)))
+                if isinstance(res, tuple):
+                     self.add("valu", ("+", v_regs[ti][0], vdn[res[1]], v_zero))
+                     v_node_val = v_regs[ti][0]
+                else:
+                     v_node_val = v_regs[ti][res]
+                
+                # Hash
+                self.add("valu", ("^", v_val_p[b], v_val_p[b], v_node_val))
+                self.build_hash_vector(v_val_p[b], v_regs[ti][1], v_regs[ti][2])
+                
+                # Update index (No wrap check)
+                v_t1 = v_regs[ti][1]
+                self.add("valu", ("&", v_t1, v_val_p[b], v_one))
+                self.add("valu", ("+", v_t1, v_t1, v_one))
+                self.add("valu", ("multiply_add", v_idx_p[b], v_idx_p[b], v_two, v_t1))
+            current_round += 1
+
+        for round in range(current_round, rounds):
             level = round % (forest_height + 1)
             for b in range(batch_size // VLEN):
                 ti = b % N_TEMPS
