@@ -282,8 +282,8 @@ class KernelBuilder:
         v_nn = self.alloc_scratch("v_nn", VLEN)
         self.add("valu", ("vbroadcast", v_nn, self.scratch["n_nodes"]))
 
-        # Optimized layers 0-4 (31 nodes)
-        MAX_OPTIMIZED_DEPTH = 4
+        # Optimized layers 0-5 (63 nodes)
+        MAX_OPTIMIZED_DEPTH = 5
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
