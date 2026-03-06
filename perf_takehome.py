@@ -213,39 +213,44 @@ class KernelBuilder:
             "v_tmp2": self.alloc_scratch(f"v_tmp2{suffix}", VLEN),
         }
 
-    def emit_gather(self, body: list, regs_list: list[dict]):
+    def emit_gather(self, regs_list: list[dict]):
         """Interleaves gathering node values for multiple vector groups using scalar loads."""
-        v_forest_p = self.scratch["v_forest_p"]
+        slots = []
+        forest_values_p_scalar = self.scratch["forest_values_p"]
         tmp_scalar_addr = self.alloc_scratch("tmp_scalar_addr") # New scratch for scalar address
 
         for vi in range(VLEN):
             for r in regs_list:
                 # Calculate individual address: forest_values_p + v_idx[vi]
-                body.append(("alu", ("+", tmp_scalar_addr, v_forest_p, r["v_idx"] + vi)))
+                slots.append(("alu", ("+", tmp_scalar_addr, forest_values_p_scalar, r["v_idx"] + vi)))
                 # Load individual element into v_node_val[vi]
-                body.append(("load", ("load", r["v_node_val"] + vi, tmp_scalar_addr)))
+                slots.append(("load", ("load", r["v_node_val"] + vi, tmp_scalar_addr)))
+        return slots
 
-    def emit_interleaved_hash(self, body: list, regs_list: list[dict]):
+    def emit_interleaved_hash(self, regs_list: list[dict]):
         """Interleaves the hash stages across all unrolled vector groups."""
+        slots = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             v_const1 = self.vector_const(val1)
             v_const3 = self.vector_const(val3)
             for r in regs_list:
-                body.append(("valu", (op1, r["v_tmp1"], r["v_val"], v_const1)))
+                slots.append(("valu", (op1, r["v_tmp1"], r["v_val"], v_const1)))
             for r in regs_list:
-                body.append(("valu", (op3, r["v_tmp2"], r["v_val"], v_const3)))
+                slots.append(("valu", (op3, r["v_tmp2"], r["v_val"], v_const3)))
             for r in regs_list:
-                body.append(("valu", (op2, r["v_val"], r["v_tmp1"], r["v_tmp2"])))
-
-    def emit_state_update(self, body: list, r: dict, v_n_nodes, v_zero, v_one, v_two):
+                slots.append(("valu", (op2, r["v_val"], r["v_tmp1"], r["v_tmp2"])))
+        return slots
+    def emit_state_update(self, r: dict, v_n_nodes, v_zero, v_one, v_two):
         """Logic for updating the index and wrapping it."""
-        body.append(("valu", ("%", r["v_tmp1"], r["v_val"], v_two)))
-        body.append(("valu", ("==", r["v_tmp1"], r["v_tmp1"], v_zero)))
-        body.append(("flow", ("vselect", r["v_tmp2"], r["v_tmp1"], v_one, v_two)))
-        body.append(("valu", ("*", r["v_idx"], r["v_idx"], v_two)))
-        body.append(("valu", ("+", r["v_idx"], r["v_idx"], r["v_tmp2"])))
-        body.append(("valu", ("<", r["v_tmp1"], r["v_idx"], v_n_nodes)))
-        body.append(("flow", ("vselect", r["v_idx"], r["v_tmp1"], r["v_idx"], v_zero)))
+        slots = []
+        slots.append(("valu", ("%", r["v_tmp1"], r["v_val"], v_two)))
+        slots.append(("valu", ("==", r["v_tmp1"], r["v_tmp1"], v_zero)))
+        slots.append(("flow", ("vselect", r["v_tmp2"], r["v_tmp1"], v_one, v_two)))
+        slots.append(("valu", ("*", r["v_idx"], r["v_idx"], v_two)))
+        slots.append(("valu", ("+", r["v_idx"], r["v_idx"], r["v_tmp2"])))
+        slots.append(("valu", ("<", r["v_tmp1"], r["v_idx"], v_n_nodes)))
+        slots.append(("flow", ("vselect", r["v_idx"], r["v_tmp1"], r["v_idx"], v_zero)))
+        return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -263,8 +268,7 @@ class KernelBuilder:
         v_zero, v_one, v_two = self.vector_const(0), self.vector_const(1), self.vector_const(2)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
+
 
         UNROLL = 4
         regs_list = [self.alloc_vector_regs(f"_{j}") for j in range(UNROLL)]
@@ -272,37 +276,36 @@ class KernelBuilder:
         ptr_values = [self.alloc_scratch(f"ptr_val_{j}") for j in range(UNROLL)]
 
         self.add("flow", ("pause",))
-        body = []
         curr_idx_base, curr_val_base = self.alloc_scratch("curr_idx_base"), self.alloc_scratch("curr_val_base")
 
         for round in range(rounds):
-            body.append(("alu", ("+", curr_idx_base, self.scratch["inp_indices_p"], self.scratch_const(0))))
-            body.append(("alu", ("+", curr_val_base, self.scratch["inp_values_p"], self.scratch_const(0))))
+            self.add("alu", ("+", curr_idx_base, self.scratch["inp_indices_p"], self.scratch_const(0)))
+            self.add("alu", ("+", curr_val_base, self.scratch["inp_values_p"], self.scratch_const(0)))
 
             for i in range(0, batch_size, VLEN * UNROLL):
                 for j in range(UNROLL):
-                    body.append(("flow", ("add_imm", ptr_indices[j], curr_idx_base, j * VLEN)))
-                    body.append(("flow", ("add_imm", ptr_values[j], curr_val_base, j * VLEN)))
+                    self.add("flow", ("add_imm", ptr_indices[j], curr_idx_base, j * VLEN))
+                    self.add("flow", ("add_imm", ptr_values[j], curr_val_base, j * VLEN))
 
                 for j in range(UNROLL):
-                    body.append(("load", ("vload", regs_list[j]["v_idx"], ptr_indices[j])))
-                    body.append(("load", ("vload", regs_list[j]["v_val"], ptr_values[j])))
+                    self.add("load", ("vload", regs_list[j]["v_idx"], ptr_indices[j]))
+                    self.add("load", ("vload", regs_list[j]["v_val"], ptr_values[j]))
 
-                self.emit_gather(body, regs_list)
+                # Gather
+                for engine, slot in self.emit_gather(regs_list):
+                    self.add(engine, slot)
 
-                # for j in range(UNROLL):
-                #     r = regs_list[j]
-                #     self.emit_state_update(body, r, v_n_nodes, v_zero, v_one, v_two)
-
-                # --- NEW SIMPLIFIED LOGIC ---
-                # Simply increment v_val and v_idx
+                # XOR and Hash
                 for r in regs_list:
-                    body.append(("valu", ("+", r["v_val"], r["v_val"], v_one)))
-                    body.append(("valu", ("+", r["v_idx"], r["v_idx"], v_one)))
-                # --- END NEW SIMPLIFIED LOGIC ---
+                    # v_val = v_val ^ v_node_val
+                    self.add("valu", ("^", r["v_val"], r["v_val"], r["v_node_val"]))
+                for engine, slot in self.emit_interleaved_hash(regs_list):
+                    self.add(engine, slot)
 
+                # State Update and Store
                 for j in range(UNROLL):
                     r = regs_list[j]
-                    self.emit_state_update(body, r, v_n_nodes, v_zero, v_one, v_two)
-                    body.append(("store", ("vstore", ptr_indices[j], r["v_idx"])))
-                    body.append(("store", ("vstore", ptr_values[j], r["v_val"])))
+                    for engine, slot in self.emit_state_update(r, v_n_nodes, v_zero, v_one, v_two):
+                        self.add(engine, slot)
+                    self.add("store", ("vstore", ptr_indices[j], r["v_idx"]))
+                    self.add("store", ("vstore", ptr_values[j], r["v_val"]))
