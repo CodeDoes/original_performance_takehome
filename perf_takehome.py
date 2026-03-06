@@ -40,6 +40,7 @@ from problem import (
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
+        self.raw_slots = [] # New list to store raw (engine, slot) tuples
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
@@ -48,15 +49,50 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+    def build(self, raw_slots: list[tuple[Engine, tuple]], vliw: bool = False):
+        if not vliw:
+            # Original behavior: one slot per instruction bundle
+            instrs = []
+            for engine, slot in raw_slots:
+                instrs.append({engine: [slot]})
+            return instrs
+        else:
+            # VLIW packing logic
+            packed_instrs = []
+            current_bundle = defaultdict(list)
 
-    def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
+            for engine, slot in raw_slots:
+                if engine == "debug":
+                    # Finalize any pending instructions before the debug
+                    if current_bundle:
+                        packed_instrs.append(dict(current_bundle))
+                        current_bundle = defaultdict(list)
+                    # Debug itself forms a single-slot bundle
+                    packed_instrs.append({engine: [slot]})
+                    current_bundle = defaultdict(list) # Ensure it's clear for next instruction
+                elif engine == "flow":
+                    # Finalize any pending instructions before the flow
+                    if current_bundle:
+                        packed_instrs.append(dict(current_bundle))
+                        current_bundle = defaultdict(list)
+                    # Flow itself forms a single-slot bundle
+                    packed_instrs.append({engine: [slot]})
+                    current_bundle = defaultdict(list) # Ensure it's clear for next instruction
+                else:
+                    # For other engines, check slot limits
+                    if len(current_bundle[engine]) >= SLOT_LIMITS.get(engine, 1):
+                        packed_instrs.append(dict(current_bundle))
+                        current_bundle = defaultdict(list)
+                    current_bundle[engine].append(slot)
+
+            # Add any remaining slots in the current_bundle
+            if current_bundle:
+                packed_instrs.append(dict(current_bundle))
+            return packed_instrs
+
+    def add(self, engine: Engine, slot: tuple):
+        # Add raw (engine, slot) tuples to a list for later packing
+        self.raw_slots.append((engine, slot))
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
