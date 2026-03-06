@@ -295,8 +295,8 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (8 sets for interleaving)
-        N_TEMPS = 8
+        # Temp registers (6 sets for interleaving)
+        N_TEMPS = 6
         # Allocate 6 registers per set to support binary mux up to Depth 4
         # v_regs[ti][0] will be the result/accumulator (v_nv)
         v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(6)] for i in range(N_TEMPS)]
