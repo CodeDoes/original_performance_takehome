@@ -247,14 +247,14 @@ class KernelBuilder:
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 multiplier = (1 << val3) + 1
-                v_mul = self.scratch_const_vector(multiplier)
-                v_add = self.scratch_const_vector(val1)
-                self.add("valu", ("multiply_add", v_val, v_val, v_mul, v_add))
+                self.add("valu", ("vbroadcast", v_t1, self.scratch_const(multiplier)))
+                self.add("valu", ("vbroadcast", v_t2, self.scratch_const(val1)))
+                self.add("valu", ("multiply_add", v_val, v_val, v_t1, v_t2))
             else:
-                v_val1 = self.scratch_const_vector(val1)
-                v_val3 = self.scratch_const_vector(val3)
-                self.add("valu", (op1, v_t1, v_val, v_val1))
-                self.add("valu", (op3, v_t2, v_val, v_val3))
+                self.add("valu", ("vbroadcast", v_t1, self.scratch_const(val1)))
+                self.add("valu", ("vbroadcast", v_t2, self.scratch_const(val3)))
+                self.add("valu", (op1, v_t1, v_val, v_t1))
+                self.add("valu", (op3, v_t2, v_val, v_t2))
                 self.add("valu", (op2, v_val, v_t1, v_t2))
 
     def build_kernel(
@@ -273,10 +273,7 @@ class KernelBuilder:
         v_zero = self.scratch_const_vector(0)
         v_one = self.scratch_const_vector(1)
         v_two = self.scratch_const_vector(2)
-        v_nn = self.alloc_scratch("v_nn", VLEN)
-        self.add("valu", ("vbroadcast", v_nn, self.scratch["n_nodes"]))
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
+        # v_nn and v_forest_p generated on the fly to save space
 
         # Optimized layers 0-3 (15 nodes)
         MAX_OPTIMIZED_DEPTH = 3
@@ -288,8 +285,8 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (20 sets for interleaving to fit 15 nodes with 4 regs)
-        N_TEMPS = 20
+        # Temp registers (24 sets for interleaving to fit 15 nodes with 4 regs)
+        N_TEMPS = 24
         # v_regs[ti][0] will be the result/accumulator (v_nv)
         v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(4)] for i in range(N_TEMPS)]
 
@@ -360,8 +357,19 @@ class KernelBuilder:
             right_op = vdn[right_res[1]] if isinstance(right_res, tuple) else v_regs[ti][right_res]
             
             # Mux logic: res = (idx < mid) ? left : right
-            self.add("valu", ("<", mask_reg, v_idx_p[b], self.scratch_const_vector(mid)))
-            self.add("flow", ("vselect", res_reg, mask_reg, left_op, right_op))
+            # Use cached constant for mid
+            mid_vec = self.scratch_const_vector(mid)
+            self.add("valu", ("<", mask_reg, v_idx_p[b], mid_vec))
+            
+            if count == 2:
+                 # Use vselect (flow) for leaves (Level 2)
+                 self.add("flow", ("vselect", res_reg, mask_reg, left_op, right_op))
+            else:
+                 # Use Valu arithmetic for upper levels
+                 # res = left - right
+                 self.add("valu", ("-", res_reg, left_op, right_op))
+                 # res = mask * res + right
+                 self.add("valu", ("multiply_add", res_reg, mask_reg, res_reg, right_op))
             
             return res_idx
 
@@ -384,9 +392,10 @@ class KernelBuilder:
                 else:
                     # Fallback to scalar loads
                     v_node_val = v_regs[ti][0]
-                    # Calculate address: v_t1 = idx + forest_p
                     v_addr = v_regs[ti][1]
-                    self.add("valu", ("+", v_addr, v_idx_p[b], v_forest_p))
+                    # v_forest_p broadcast
+                    self.add("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))
+                    self.add("valu", ("+", v_addr, v_idx_p[b], v_addr))
                     for vi in range(VLEN):
                         self.add("load", ("load", v_node_val + vi, v_addr + vi))
 
@@ -403,7 +412,9 @@ class KernelBuilder:
                 self.add("valu", ("+", v_t1, v_t1, v_one))
                 self.add("valu", ("multiply_add", v_idx_p[b], v_idx_p[b], v_two, v_t1))
                 
-                self.add("valu", ("<", v_t1, v_idx_p[b], v_nn))
+                # Broadcast n_nodes to v_regs[ti][2] (v_t1 is dest)
+                self.add("valu", ("vbroadcast", v_regs[ti][2], self.scratch["n_nodes"]))
+                self.add("valu", ("<", v_t1, v_idx_p[b], v_regs[ti][2]))
                 self.add("valu", ("*", v_idx_p[b], v_idx_p[b], v_t1))
 
         # Final Store
