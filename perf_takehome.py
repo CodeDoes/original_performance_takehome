@@ -143,55 +143,77 @@ class KernelBuilder:
                 instrs.append({engine: [slot]})
             return instrs
 
-        packed_instrs = []
-        current_bundle = defaultdict(list)
-        bundle_reads = set()
-        bundle_writes = set()
+        # List scheduling algorithm
+        packed_instrs = [] # List of defaultdict(list)
+        last_write_cycle = {} # addr -> cycle_index
+        last_read_cycle = {}  # addr -> cycle_index
+        barrier_cycle = -1
+
+        def get_bundle(c):
+            while len(packed_instrs) <= c:
+                packed_instrs.append(defaultdict(list))
+            return packed_instrs[c]
 
         for engine, slot in raw_slots:
             reads, writes = self.get_reads_writes(engine, slot)
             
-            # Check for hazards
-            # RAW: current slot reads something written in current bundle
-            raw_hazard = any(r in bundle_writes for r in reads)
-            # WAW: current slot writes something already written in current bundle
-            waw_hazard = any(w in bundle_writes for w in writes)
-            # Structural: engine limit reached
-            structural_hazard = len(current_bundle[engine]) >= SLOT_LIMITS.get(engine, 1)
+            # 1. Earliest cycle based on RAW hazards and barriers
+            start_cycle = barrier_cycle + 1
+            for r in reads:
+                if r in last_write_cycle:
+                    start_cycle = max(start_cycle, last_write_cycle[r] + 1)
             
-            # Special case for 'flow', 'pause', and 'debug'
-            break_hazard = False
-            if engine == "flow":
-                if slot[0] in ("pause", "halt", "cond_jump", "cond_jump_rel", "jump", "jump_indirect"):
-                    break_hazard = True
+            # 2. Earliest cycle based on WAR hazards (write cannot precede program-order-previous read)
+            for w in writes:
+                if w in last_read_cycle:
+                    start_cycle = max(start_cycle, last_read_cycle[w])
+
+            is_barrier = False
+            if engine == "flow" and slot[0] in ("pause", "halt", "cond_jump", "cond_jump_rel", "jump", "jump_indirect"):
+                is_barrier = True
             elif engine == "debug":
-                break_hazard = True
+                is_barrier = True
+            
+            if is_barrier:
+                start_cycle = len(packed_instrs)
 
-            if raw_hazard or waw_hazard or structural_hazard or break_hazard:
-                if current_bundle:
-                    packed_instrs.append(dict(current_bundle))
-                    current_bundle = defaultdict(list)
-                    bundle_reads = set()
-                    bundle_writes = set()
+            # 3. Find first cycle >= start_cycle with a free slot and no WAW hazards
+            c = start_cycle
+            while True:
+                bundle = get_bundle(c)
                 
-                # Re-calculate hazards for the new empty bundle
-                reads, writes = self.get_reads_writes(engine, slot)
+                # Structural hazard
+                if len(bundle[engine]) >= SLOT_LIMITS.get(engine, 1):
+                    c += 1
+                    continue
+                
+                # WAW hazard in same bundle (multiple writes to same addr in same cycle)
+                waw_hazard = False
+                for existing_engine, existing_slots in bundle.items():
+                    for existing_slot in existing_slots:
+                        _, existing_writes = self.get_reads_writes(existing_engine, existing_slot)
+                        if any(w in existing_writes for w in writes):
+                            waw_hazard = True
+                            break
+                    if waw_hazard: break
+                
+                if waw_hazard:
+                    c += 1
+                    continue
+                
+                # If we reach here, we can place the slot in cycle c
+                bundle[engine].append(slot)
+                for w in writes:
+                    last_write_cycle[w] = c
+                for r in reads:
+                    last_read_cycle[r] = c
+                
+                if is_barrier:
+                    barrier_cycle = c
+                
+                break
 
-            current_bundle[engine].append(slot)
-            bundle_reads.update(reads)
-            bundle_writes.update(writes)
-
-            # If this was a break_hazard, we should also break AFTER it
-            if break_hazard:
-                packed_instrs.append(dict(current_bundle))
-                current_bundle = defaultdict(list)
-                bundle_reads = set()
-                bundle_writes = set()
-
-        if current_bundle:
-            packed_instrs.append(dict(current_bundle))
-        
-        return packed_instrs
+        return [dict(b) for b in packed_instrs]
 
     def add(self, engine: Engine, slot: tuple):
         # Add raw (engine, slot) tuples to a list for later packing
