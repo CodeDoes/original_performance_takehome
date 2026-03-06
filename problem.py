@@ -111,7 +111,7 @@ class Machine:
         self.program = program
         self.debug_info = debug_info
         self.value_trace = value_trace
-        self.prints = False
+        self.prints = True
         self.cycle = 0
         self.enable_pause = True
         self.enable_debug = True
