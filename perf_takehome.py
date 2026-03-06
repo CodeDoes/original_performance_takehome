@@ -305,58 +305,60 @@ class KernelBuilder:
         # Use multiple sets to break dependencies in scalar loads
         tmp_addr_idx = self.alloc_scratch("tmp_addr_idx")
         tmp_addr_val = self.alloc_scratch("tmp_addr_val")
-        tmp_scalar_node_addrs = [self.alloc_scratch(f"tmp_node_addr_{vi}") for vi in range(VLEN)]
+        
+        # We'll use 4 batches of vector registers to overlap operations
+        N_OVERLAP = 4
+        v_indices = [self.alloc_scratch(f"v_idx_{b}", VLEN) for b in range(N_OVERLAP)]
+        v_values = [self.alloc_scratch(f"v_val_{b}", VLEN) for b in range(N_OVERLAP)]
+        v_node_vals = [self.alloc_scratch(f"v_node_val_{b}", VLEN) for b in range(N_OVERLAP)]
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        
+        tmp_node_addrs = [[self.alloc_scratch(f"tmp_node_addr_{b}_{vi}") for vi in range(VLEN)] for b in range(N_OVERLAP)]
 
-        for round in range(rounds):
-            for i in range(0, batch_size, VLEN):
-                # 1. Load indices and values for the batch
-                self.add("load", ("vload", v_idx, batch_addr_idx_map[i]))
-                self.add("load", ("vload", v_val, batch_addr_val_map[i]))
+        for i_base in range(0, batch_size, N_OVERLAP * VLEN):
+            # 0. Initial load from memory
+            for b in range(N_OVERLAP):
+                i = i_base + b * VLEN
+                self.add("load", ("vload", v_indices[b], batch_addr_idx_map[i]))
+                self.add("load", ("vload", v_values[b], batch_addr_val_map[i]))
+
+            for round in range(rounds):
+                # 1. Load node values for all overlapped batches
+                for b in range(N_OVERLAP):
+                    for vi in range(VLEN):
+                        self.add("alu", ("+", tmp_node_addrs[b][vi], self.scratch["forest_values_p"], v_indices[b] + vi))
                 
-                # Debug compare (vectorized)
-                self.add("debug", ("vcompare", v_idx, [(round, i + vi, "idx") for vi in range(VLEN)]))
-                self.add("debug", ("vcompare", v_val, [(round, i + vi, "val") for vi in range(VLEN)]))
+                for b in range(N_OVERLAP):
+                    for vi in range(VLEN):
+                        self.add("load", ("load", v_node_vals[b] + vi, tmp_node_addrs[b][vi]))
 
-                # 2. Load node values (optimized with multiple addr registers)
-                for vi in range(VLEN):
-                    self.add("alu", ("+", tmp_scalar_node_addrs[vi], self.scratch["forest_values_p"], v_idx + vi))
-                for vi in range(VLEN):
-                    self.add("load", ("load", v_node_val + vi, tmp_scalar_node_addrs[vi]))
+                # 2. Process each batch (hash and update)
+                for b in range(N_OVERLAP):
+                    # Hash
+                    self.add("valu", ("^", v_values[b], v_values[b], v_node_vals[b]))
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        self.add("valu", (op1, v_tmp1, v_values[b], v_c1_map[hi]))
+                        self.add("valu", (op3, v_tmp2, v_values[b], v_c3_map[hi]))
+                        self.add("valu", (op2, v_values[b], v_tmp1, v_tmp2))
 
-                self.add("debug", ("vcompare", v_node_val, [(round, i + vi, "node_val") for vi in range(VLEN)]))
-
-                # 3. Hash calculation: val = myhash(val ^ node_val)
-                self.add("valu", ("^", v_val, v_val, v_node_val))
-                
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    v_c1 = v_c1_map[hi]
-                    v_c3 = v_c3_map[hi]
+                    # Update Index
+                    self.add("valu", ("%", v_tmp1, v_values[b], v_two))
+                    self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
+                    self.add("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two))
+                    self.add("valu", ("*", v_indices[b], v_indices[b], v_two))
+                    self.add("valu", ("+", v_indices[b], v_indices[b], v_tmp3))
                     
-                    self.add("valu", (op1, v_tmp1, v_val, v_c1))
-                    self.add("valu", (op3, v_tmp2, v_val, v_c3))
-                    self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
-                    self.add("debug", ("vcompare", v_val, [(round, i + vi, "hash_stage", hi) for vi in range(VLEN)]))
+                    # Wrap
+                    self.add("valu", ("<", v_tmp1, v_indices[b], v_n_nodes))
+                    self.add("flow", ("vselect", v_indices[b], v_tmp1, v_indices[b], v_zero))
 
-                self.add("debug", ("vcompare", v_val, [(round, i + vi, "hashed_val") for vi in range(VLEN)]))
-
-                # 4. Update indices: idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.add("valu", ("%", v_tmp1, v_val, v_two))
-                self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
-                self.add("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two))
-                self.add("valu", ("*", v_idx, v_idx, v_two))
-                self.add("valu", ("+", v_idx, v_idx, v_tmp3))
-                
-                self.add("debug", ("vcompare", v_idx, [(round, i + vi, "next_idx") for vi in range(VLEN)]))
-
-                # 5. Wrap indices: idx = 0 if idx >= n_nodes else idx
-                self.add("valu", ("<", v_tmp1, v_idx, v_n_nodes))
-                self.add("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero))
-                
-                self.add("debug", ("vcompare", v_idx, [(round, i + vi, "wrapped_idx") for vi in range(VLEN)]))
-
-                # 6. Store indices and values
-                self.add("store", ("vstore", batch_addr_idx_map[i], v_idx))
-                self.add("store", ("vstore", batch_addr_val_map[i], v_val))
+            # 3. Final store to memory
+            for b in range(N_OVERLAP):
+                i = i_base + b * VLEN
+                self.add("store", ("vstore", batch_addr_idx_map[i], v_indices[b]))
+                self.add("store", ("vstore", batch_addr_val_map[i], v_values[b]))
 
         self.add("flow", ("pause",))
         self.instrs = self.build(self.raw_slots, vliw=True)
