@@ -46,3 +46,13 @@ This document summarizes the optimizations implemented for the tree traversal ke
 
 ### 3. Dynamic Constants
 - Generating constants on-the-fly (`vbroadcast`) saved space but increased `valu` pressure by ~40%, causing regression.
+
+## 5. Theoretical Analysis
+- **Current Bottleneck**: `load` engine bandwidth.
+  - Configuration: Depth 2, N=30.
+  - Loads per round: 240.
+  - Slots: 2.
+  - Min Cycles: 120 per round -> 1920 total.
+  - Actual: 1957.
+  - Efficiency: 98%.
+- **Implication**: Further speedups require reducing load count (without increasing Valu cost) or algorithmic shortcuts.

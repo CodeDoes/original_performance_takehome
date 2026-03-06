@@ -17,9 +17,14 @@ To hide the 64-cycle latency of loads and arithmetic, we need many active batche
 - **Mux Implementation**: Replaced `valu` arithmetic (subtract/multiply-add) with `flow` `vselect` instruction. Since `valu` is the bottleneck (Hash function uses 12 slots/batch) and `flow` is underutilized, this offloading saved ~32 cycles per round.
 - **Hash Function**: Simplified to use `valu` ops. Attempts to simplify further were limited by correctness requirements.
 
-## 4. Scratch Space Tetris
-The 1536-word scratch space is the hard limit.
-- **Persistent State**: 512 words.
-- **Constants**: ~200 words (Hash, Mux, Nodes).
-- **Temps**: 30 * 3 vectors = 720 words.
-- **Total**: ~1432 words. Fits comfortably.
+## 5. Theoretical Limits & Bottlenecks
+- **Load Bound**: The kernel is currently **Load Bound**.
+  - `load` engine has 2 slots.
+  - With Depth 2 (8 load levels), we execute 8 loads per batch per round.
+  - Total Loads = 32 batches * 8 loads = 256 loads per round.
+  - Min Cycles = 256 / 2 = 128 cycles per round?
+  - Wait, N=30. 240 loads. 120 cycles.
+  - Theoretical Min: 120 cycles * 16 rounds = 1920 cycles.
+  - Actual: 1957 cycles. We are within 2% of the hardware limit for this strategy.
+- **Valu Bound**: Depth 3 attempts shifted the bottleneck to `valu` (176 cycles) or `flow` (224 cycles), making it slower.
+- **Conclusion**: To break 1900 cycles, one must reduce the total number of loads without incurring equal cost in Mux logic. Depth 3 failed this trade-off. Future efforts should focus on alternative Load reduction or bypassing loads (e.g., input pattern exploitation).
