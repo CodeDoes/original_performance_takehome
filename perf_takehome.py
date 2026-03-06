@@ -38,7 +38,7 @@ from problem import (
 
 # Configuration Flags
 MAX_OPTIMIZED_DEPTH = 2      # Depth 2 (3 levels Mux) is optimal due to Mux vs Load trade-off
-N_TEMPS = 32                 # Maximize batches to hide latency (fits in space with Depth 2)
+N_TEMPS = 30                 # Maximize batches to hide latency (fits in space with Depth 2)
 USE_VSELECT_MUX = True       # Use flow engine for Mux to offload Valu
 USE_DYNAMIC_CONSTANTS = False # Cached constants are faster (Valu bound)
 
