@@ -325,7 +325,7 @@ class KernelBuilder:
             for b in range(batch_size // VLEN):
                 ti = b % N_TEMPS
                 
-                if level <= MAX_OPTIMIZED_DEPTH:
+                if level <= V_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
                     if curr_num == 1:
@@ -347,6 +347,7 @@ class KernelBuilder:
                         self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
                         self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], v_t2[ti]))
                     else:
+                        # Linear search mux
                         self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
                         for i in range(curr_num - 1):
                             ni = curr_start + i
@@ -354,7 +355,7 @@ class KernelBuilder:
                             self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
                             self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], v_nv[ti]))
                 else:
-                    # Fallback to scalar loads but use VALU for address calc
+                    # Fallback to scalar loads
                     self.add("valu", ("+", v_t1[ti], v_idx_p[b], v_forest_p))
                     for vi in range(VLEN):
                         self.add("load", ("load", v_nv[ti] + vi, v_t1[ti] + vi))
