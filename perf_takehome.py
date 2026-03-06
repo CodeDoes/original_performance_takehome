@@ -284,18 +284,19 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-4 (31 nodes)
-        MAX_OPTIMIZED_DEPTH = 4
+        # Optimized layers 0-3 (15 nodes)
+        MAX_OPTIMIZED_DEPTH = 3
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
+        v_const_idx = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)]
         
         # Persistent state for 32 batches
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (8 sets for interleaving)
-        N_TEMPS = 8
+        # Temp registers (16 sets for interleaving)
+        N_TEMPS = 16
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
@@ -326,19 +327,19 @@ class KernelBuilder:
                     if curr_num == 1:
                         self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
                     elif curr_num == 2:
-                        self.add("valu", ("==", v_mask, v_idx_p[b], self.scratch_const_vector(1)))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[1]))
                         self.add("valu", ("-", v_t1[ti], vdn[1], vdn[2]))
                         self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[2]))
                     elif curr_num == 4:
-                        self.add("valu", ("==", v_mask, v_idx_p[b], self.scratch_const_vector(3)))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[3]))
                         self.add("valu", ("-", v_t1[ti], vdn[3], vdn[4]))
                         self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[4]))
                         
-                        self.add("valu", ("==", v_mask, v_idx_p[b], self.scratch_const_vector(5)))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[5]))
                         self.add("valu", ("-", v_t1[ti], vdn[5], vdn[6]))
                         self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[6]))
                         
-                        self.add("valu", ("<", v_mask, v_idx_p[b], self.scratch_const_vector(5)))
+                        self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[5]))
                         self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
                         self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
                     else:
@@ -346,7 +347,7 @@ class KernelBuilder:
                         self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
                         for i in range(curr_num - 1):
                             ni = curr_start + i
-                            self.add("valu", ("==", v_mask, v_idx_p[b], self.scratch_const_vector(ni)))
+                            self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[ni]))
                             self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
                             self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_nv[ti]))
                 else:
