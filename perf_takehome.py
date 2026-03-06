@@ -283,7 +283,7 @@ class KernelBuilder:
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
-        v_const_idx = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)]
+        # v_const_idx = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)] # Removed to save space
         
         # Persistent state for 32 batches
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
@@ -355,7 +355,7 @@ class KernelBuilder:
             right_op = vdn[right_res[1]] if isinstance(right_res, tuple) else v_regs[ti][right_res]
             
             # Mux logic: res = (idx < mid) ? left : right
-            self.add("valu", ("<", mask_reg, v_idx_p[b], v_const_idx[mid]))
+            self.add("valu", ("<", mask_reg, v_idx_p[b], self.scratch_const_vector(mid)))
             self.add("valu", ("-", res_reg, left_op, right_op)) # res = left - right
             self.add("valu", ("multiply_add", res_reg, mask_reg, res_reg, right_op))
             
