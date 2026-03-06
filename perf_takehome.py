@@ -261,6 +261,28 @@ class KernelBuilder:
                     v_add = self.scratch_const_vector(val1)
                 
                 self.add("valu", ("multiply_add", v_val, v_val, v_mul, v_add))
+            elif hi == 1:
+                # Offload Stage 1 entirely to ALU (8 scalar ops * 3)
+                s_val1 = self.scratch_const(val1)
+                s_val3 = self.scratch_const(val3)
+                for i in range(VLEN):
+                    self.add("alu", (op1, v_t1 + i, v_val + i, s_val1))
+                    self.add("alu", (op3, v_t2 + i, v_val + i, s_val3))
+                    self.add("alu", (op2, v_val + i, v_t1 + i, v_t2 + i))
+            elif hi == 3:
+                # Offload 1/3 of Stage 3 to ALU
+                s_val1 = self.scratch_const(val1)
+                for i in range(VLEN):
+                     self.add("alu", (op1, v_t1 + i, v_val + i, s_val1))
+                
+                if USE_DYNAMIC_CONSTANTS:
+                     self.add("valu", ("vbroadcast", v_t2, self.scratch_const(val3)))
+                     v_val3 = v_t2
+                else:
+                     v_val3 = self.scratch_const_vector(val3)
+
+                self.add("valu", (op3, v_t2, v_val, v_val3))
+                self.add("valu", (op2, v_val, v_t1, v_t2))
             else:
                 if USE_DYNAMIC_CONSTANTS:
                     self.add("valu", ("vbroadcast", v_t1, self.scratch_const(val1)))
