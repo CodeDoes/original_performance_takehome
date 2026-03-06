@@ -291,6 +291,8 @@ class KernelBuilder:
         
         # Scalar registers for address calculation
         # Use multiple sets to break dependencies in scalar loads
+        tmp_addr_idx = self.alloc_scratch("tmp_addr_idx")
+        tmp_addr_val = self.alloc_scratch("tmp_addr_val")
         tmp_scalar_node_addrs = [self.alloc_scratch(f"tmp_node_addr_{vi}") for vi in range(VLEN)]
 
         for round in range(rounds):
