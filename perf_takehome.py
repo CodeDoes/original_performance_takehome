@@ -250,12 +250,6 @@ class KernelBuilder:
                 v_mul = self.scratch_const_vector(multiplier)
                 v_add = self.scratch_const_vector(val1)
                 self.add("valu", ("multiply_add", v_val, v_val, v_mul, v_add))
-            elif op1 == "+" and op2 == "^" and op3 == "<<":
-                v_one_vec = self.scratch_const_vector(1)
-                v_val1 = self.scratch_const_vector(val1)
-                self.add("valu", ("multiply_add", v_t1, v_val, v_one_vec, v_val1))
-                self.add("valu", (op3, v_t2, v_val, self.scratch_const_vector(val3)))
-                self.add("valu", (op2, v_val, v_t1, v_t2))
             else:
                 v_val1 = self.scratch_const_vector(val1)
                 v_val3 = self.scratch_const_vector(val3)
@@ -295,8 +289,8 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (16 sets for interleaving)
-        N_TEMPS = 16
+        # Temp registers (32 sets for interleaving)
+        N_TEMPS = 32
         # v_regs[ti][0] will be the result/accumulator (v_nv)
         v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(3)] for i in range(N_TEMPS)]
 
