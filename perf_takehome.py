@@ -284,8 +284,8 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-3 (15 nodes)
-        MAX_OPTIMIZED_DEPTH = 3
+        # Optimized layers 0-4 (31 nodes)
+        MAX_OPTIMIZED_DEPTH = 4
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
@@ -294,13 +294,12 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (one set per batch for full interleaving)
-        N_TEMPS = 32
+        # Temp registers (16 sets for interleaving)
+        N_TEMPS = 16
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
-        # Use v_ct sparingly or reuse vt1/vt2 if possible
-        v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(8)] 
+        v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(N_TEMPS)]
 
         ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
         ba_val = [self.alloc_scratch(f"bav_{i}") for i in range(0, batch_size, VLEN)]
@@ -322,83 +321,18 @@ class KernelBuilder:
         for round in range(rounds):
             level = round % (forest_height + 1)
             for b in range(batch_size // VLEN):
-                ti = b # ti is b for N_TEMPS=32
+                ti = b % N_TEMPS
                 
                 if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
-                    if curr_num == 1:
-                        self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
-                    else:
-                        # Binary search mux
-                        # v_t1 is mask, v_t2 is diff, result goes to v_nv
-                        mask_bit = 0
-                        v_mask_const = self.scratch_const_vector(1 << mask_bit)
-                        # We need to know which bit of idx to check.
-                        # Actually, level 1: bit 0. level 2: bit 0 and 1. level 3: bit 0, 1, 2.
-                        # Wait, idx is updated as idx = idx * 2 + (bit+1).
-                        # Level 0: idx=0.
-                        # Level 1: idx=1 or 2. (bit 0 determines)
-                        # Level 2: idx=3,4 or 5,6.
-                        # The relative index (idx - start) is exactly what the bits tell us.
-                        # rel = idx - (2^level - 1)
-                        # For level 1: rel is 0 or 1.
-                        # For level 2: rel is 0,1,2,3.
-                        
-                        # rel_idx = idx - curr_start
-                        self.add("load", ("const", ts, curr_start))
-                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                        self.add("valu", ("-", v_t1[ti], v_idx_p[b], v_t1[ti])) # v_t1 is rel_idx
-                        
-                        prev_layer = [vdn[curr_start + i] for i in range(curr_num)]
-                        # We'll use v_nv[ti] and v_t2[ti] for intermediate layer results
-                        # but we need more if we have many layers.
-                        # For depth 3 (8 nodes), we have 3 layers of muxes.
-                        # layer 0: 8 nodes. layer 1: 4 nodes. layer 2: 2 nodes. layer 3: 1 node.
-                        
-                        # Let's just do it step-by-step for simplicity and performance.
-                        if level == 1:
-                            # 2 nodes: vdn[1, 2]. rel 0 or 1.
-                            self.add("valu", ("&", v_t2[ti], v_t1[ti], v_one))
-                            self.add("valu", ("==", v_t2[ti], v_t2[ti], v_zero)) # mask = (rel == 0)
-                            self.add("valu", ("-", v_nv[ti], vdn[1], vdn[2]))
-                            self.add("valu", ("multiply_add", v_nv[ti], v_t2[ti], v_nv[ti], vdn[2]))
-                        elif level == 2:
-                            # 4 nodes: vdn[3,4,5,6]. rel 0,1,2,3.
-                            # bit 0 chooses between (3,4) and (5,6)
-                            self.add("valu", ("&", v_t2[ti], v_t1[ti], v_one))
-                            self.add("valu", ("==", v_t2[ti], v_t2[ti], v_zero))
-                            self.add("valu", ("-", v_nv[ti], vdn[3], vdn[4]))
-                            self.add("valu", ("multiply_add", v_nv[ti], v_t2[ti], v_nv[ti], vdn[4])) # v_nv is (3,4)
-                            self.add("valu", ("-", v_t2[ti], vdn[5], vdn[6]))
-                            # Oops, I need another register for the second mux.
-                            # Let's use v_t1 as it's no longer needed for rel_idx if we re-read it or mask it.
-                            # Actually, bit 1 chooses between v_nv and the other one.
-                            # Let's use v_ct for intermediate if level > 2.
-                            self.add("valu", ("&", v_t1[ti], v_t1[ti], v_two))
-                            # ... this is getting complicated for 32 batches.
-                            # Let's just use linear search for Level 2,3 if it's too hard to fit intermediate registers.
-                            # Linear search for 4 nodes is 3 * 3 = 9 VALU instructions. 9 * 32 = 288.
-                            # 288 / 6 = 48 cycles. Still VERY fast.
-                            
-                            self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
-                            for i in range(curr_num - 1):
-                                ni = curr_start + i
-                                self.add("load", ("const", ts, ni))
-                                self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                                self.add("valu", ("==", v_t1[ti], v_idx_p[b], v_t1[ti]))
-                                self.add("valu", ("-", v_t2[ti], vdn[ni], v_nv[ti]))
-                                self.add("valu", ("multiply_add", v_nv[ti], v_t1[ti], v_t2[ti], v_nv[ti]))
-                        elif level == 3:
-                            # Linear search for 8 nodes (7 * 3 = 21 instructions)
-                            self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
-                            for i in range(curr_num - 1):
-                                ni = curr_start + i
-                                self.add("load", ("const", ts, ni))
-                                self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                                self.add("valu", ("==", v_t1[ti], v_idx_p[b], v_t1[ti]))
-                                self.add("valu", ("-", v_t2[ti], vdn[ni], v_nv[ti]))
-                                self.add("valu", ("multiply_add", v_nv[ti], v_t1[ti], v_t2[ti], v_nv[ti]))
+                    # Linear search mux is simple and fits 16 batches well
+                    self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
+                    for i in range(curr_num - 1):
+                        ni = curr_start + i
+                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], self.scratch_const_vector(ni)))
+                        self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_ct[ti], v_t1[ti], v_nv[ti]))
                 else:
                     # Fallback to scalar loads but use VALU for address calc
                     self.add("valu", ("+", v_t1[ti], v_idx_p[b], v_forest_p))
