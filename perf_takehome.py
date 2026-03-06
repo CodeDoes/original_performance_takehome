@@ -331,7 +331,7 @@ class KernelBuilder:
                         self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
                     elif curr_num == 2:
                         # mux between vdn[1], vdn[2]
-                        self.add("alu", ("const", ts, 1))
+                        self.add("load", ("const", ts, 1))
                         self.add("valu", ("vbroadcast", v_t1[ti], ts))
                         self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
                         self.add("valu", ("-", v_t2[ti], vdn[1], vdn[2]))
@@ -339,13 +339,13 @@ class KernelBuilder:
                     elif curr_num == 4:
                         # binary search mux for vdn[3,4,5,6]
                         # bit 0 chooses between (3,4) and (5,6)
-                        self.add("alu", ("const", ts, 3))
+                        self.add("load", ("const", ts, 3))
                         self.add("valu", ("vbroadcast", v_t1[ti], ts))
                         self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
                         self.add("valu", ("-", v_t1[ti], vdn[3], vdn[4]))
                         self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], vdn[4])) # v_nv is mux(3,4)
                         
-                        self.add("alu", ("const", ts, 5))
+                        self.add("load", ("const", ts, 5))
                         self.add("valu", ("vbroadcast", v_t1[ti], ts))
                         self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
                         self.add("valu", ("-", v_t1[ti], vdn[5], vdn[6]))
@@ -360,7 +360,7 @@ class KernelBuilder:
                         self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
                         for i in range(curr_num - 1):
                             ni = curr_start + i
-                            self.add("alu", ("const", ts, ni))
+                            self.add("load", ("const", ts, ni))
                             self.add("valu", ("vbroadcast", v_t1[ti], ts))
                             self.add("valu", ("==", v_mask, v_idx_p[b], v_t1[ti]))
                             self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
