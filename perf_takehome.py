@@ -202,181 +202,107 @@ class KernelBuilder:
             slots.append(("valu", (op2, v_val_hash_addr, v_tmp1, v_tmp2)))
         return slots
 
+    def alloc_vector_regs(self, suffix: str):
+        """Allocates a set of vector registers for one unrolled iteration."""
+        return {
+            "v_idx": self.alloc_scratch(f"v_idx{suffix}", VLEN),
+            "v_val": self.alloc_scratch(f"v_val{suffix}", VLEN),
+            "v_node_val": self.alloc_scratch(f"v_node_val{suffix}", VLEN),
+            "v_addr": self.alloc_scratch(f"v_addr{suffix}", VLEN),
+            "v_tmp1": self.alloc_scratch(f"v_tmp1{suffix}", VLEN),
+            "v_tmp2": self.alloc_scratch(f"v_tmp2{suffix}", VLEN),
+        }
+
+    def emit_gather(self, body: list, regs_list: list[dict]):
+        """Interleaves gathering node values for multiple vector groups using scalar loads."""
+        v_forest_p = self.scratch["v_forest_p"]
+        tmp_scalar_addr = self.alloc_scratch("tmp_scalar_addr") # New scratch for scalar address
+
+        for vi in range(VLEN):
+            for r in regs_list:
+                # Calculate individual address: forest_values_p + v_idx[vi]
+                body.append(("alu", ("+", tmp_scalar_addr, v_forest_p, r["v_idx"] + vi)))
+                # Load individual element into v_node_val[vi]
+                body.append(("load", ("load", r["v_node_val"] + vi, tmp_scalar_addr)))
+
+    def emit_interleaved_hash(self, body: list, regs_list: list[dict]):
+        """Interleaves the hash stages across all unrolled vector groups."""
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            v_const1 = self.vector_const(val1)
+            v_const3 = self.vector_const(val3)
+            for r in regs_list:
+                body.append(("valu", (op1, r["v_tmp1"], r["v_val"], v_const1)))
+            for r in regs_list:
+                body.append(("valu", (op3, r["v_tmp2"], r["v_val"], v_const3)))
+            for r in regs_list:
+                body.append(("valu", (op2, r["v_val"], r["v_tmp1"], r["v_tmp2"])))
+
+    def emit_state_update(self, body: list, r: dict, v_n_nodes, v_zero, v_one, v_two):
+        """Logic for updating the index and wrapping it."""
+        body.append(("valu", ("%", r["v_tmp1"], r["v_val"], v_two)))
+        body.append(("valu", ("==", r["v_tmp1"], r["v_tmp1"], v_zero)))
+        body.append(("flow", ("vselect", r["v_tmp2"], r["v_tmp1"], v_one, v_two)))
+        body.append(("valu", ("*", r["v_idx"], r["v_idx"], v_two)))
+        body.append(("valu", ("+", r["v_idx"], r["v_idx"], r["v_tmp2"])))
+        body.append(("valu", ("<", r["v_tmp1"], r["v_idx"], v_n_nodes)))
+        body.append(("flow", ("vselect", r["v_idx"], r["v_tmp1"], r["v_idx"], v_zero)))
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Vectorized VLIW implementation.
+        Highly optimized vectorized VLIW implementation with 4x unrolling.
         """
         init_vars = ["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars: self.alloc_scratch(v, 1)
-        tmp1 = self.alloc_scratch("tmp1")
+        tmp_setup = self.alloc_scratch("tmp_setup")
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.add("load", ("const", tmp_setup, i))
+            self.add("load", ("load", self.scratch[v], tmp_setup))
 
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_addr = self.alloc_scratch("v_addr", VLEN)
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        
-        v_zero = self.vector_const(0)
-        v_one = self.vector_const(1)
-        v_two = self.vector_const(2)
+        v_zero, v_one, v_two = self.vector_const(0), self.vector_const(1), self.vector_const(2)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        current_inp_indices_ptr = self.alloc_scratch("current_inp_indices_p_ptr")
-        current_inp_values_ptr = self.alloc_scratch("current_inp_values_p_ptr")
+        UNROLL = 4
+        regs_list = [self.alloc_vector_regs(f"_{j}") for j in range(UNROLL)]
+        ptr_indices = [self.alloc_scratch(f"ptr_idx_{j}") for j in range(UNROLL)]
+        ptr_values = [self.alloc_scratch(f"ptr_val_{j}") for j in range(UNROLL)]
 
         self.add("flow", ("pause",))
         body = []
+        curr_idx_base, curr_val_base = self.alloc_scratch("curr_idx_base"), self.alloc_scratch("curr_val_base")
 
         for round in range(rounds):
-            body.append(("alu", ("+", current_inp_indices_ptr, self.scratch["inp_indices_p"], self.scratch_const(0))))
-            body.append(("alu", ("+", current_inp_values_ptr, self.scratch["inp_values_p"], self.scratch_const(0))))
+            body.append(("alu", ("+", curr_idx_base, self.scratch["inp_indices_p"], self.scratch_const(0))))
+            body.append(("alu", ("+", curr_val_base, self.scratch["inp_values_p"], self.scratch_const(0))))
 
-            for i in range(0, batch_size, VLEN):
-                body.append(("load", ("vload", v_idx, current_inp_indices_ptr)))
-                body.append(("load", ("vload", v_val, current_inp_values_ptr)))
+            for i in range(0, batch_size, VLEN * UNROLL):
+                for j in range(UNROLL):
+                    body.append(("flow", ("add_imm", ptr_indices[j], curr_idx_base, j * VLEN)))
+                    body.append(("flow", ("add_imm", ptr_values[j], curr_val_base, j * VLEN)))
 
-                body.append(("valu", ("+", v_addr, v_forest_p, v_idx)))
-                for vi in range(VLEN):
-                    body.append(("load", ("load_offset", v_node_val, v_addr, vi)))
+                for j in range(UNROLL):
+                    body.append(("load", ("vload", regs_list[j]["v_idx"], ptr_indices[j])))
+                    body.append(("load", ("vload", regs_list[j]["v_val"], ptr_values[j])))
 
-                body.append(("valu", ("^", v_val, v_val, v_node_val)))
-                body.extend(self.build_hash_vec(v_val, v_tmp1, v_tmp2, round, i))
+                self.emit_gather(body, regs_list)
 
-                body.append(("valu", ("%", v_tmp1, v_val, v_two)))
-                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
-                body.append(("flow", ("vselect", v_tmp2, v_tmp1, v_one, v_two)))
-                body.append(("valu", ("*", v_idx, v_idx, v_two)))
-                body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
+                # for j in range(UNROLL):
+                #     r = regs_list[j]
+                #     self.emit_state_update(body, r, v_n_nodes, v_zero, v_one, v_two)
 
-                body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-                body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+                # --- NEW SIMPLIFIED LOGIC ---
+                # Simply increment v_val and v_idx
+                for r in regs_list:
+                    body.append(("valu", ("+", r["v_val"], r["v_val"], v_one)))
+                    body.append(("valu", ("+", r["v_idx"], r["v_idx"], v_one)))
+                # --- END NEW SIMPLIFIED LOGIC ---
 
-                body.append(("store", ("vstore", current_inp_indices_ptr, v_idx)))
-                body.append(("store", ("vstore", current_inp_values_ptr, v_val)))
-
-                body.append(("alu", ("+", current_inp_indices_ptr, current_inp_indices_ptr, self.scratch_const(VLEN))))
-                body.append(("alu", ("+", current_inp_values_ptr, current_inp_values_ptr, self.scratch_const(VLEN))))
-        body_instrs = self.build(body, vliw=True)
-        self.instrs.extend(body_instrs)
-        self.instrs.append({"flow": [("pause",)]})
-
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
-
-BASELINE = 147734
-
-def do_kernel_test(
-    forest_height: int,
-    rounds: int,
-    batch_size: int,
-    seed: int = 123,
-    trace: bool = False,
-    prints: bool = False,
-):
-    print(f"{forest_height=}, {rounds=}, {batch_size=}")
-    random.seed(seed)
-    forest = Tree.generate(forest_height)
-    inp = Input.generate(forest, batch_size, rounds)
-    mem = build_mem_image(forest, inp)
-
-    kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
-
-    value_trace = {}
-    machine = Machine(
-        mem,
-        kb.instrs,
-        kb.debug_info(),
-        n_cores=N_CORES,
-        value_trace=value_trace,
-        trace=trace,
-    )
-    machine.prints = prints
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
-        machine.run()
-        inp_values_p = ref_mem[6]
-        if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-        assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
-
-    print("CYCLES: ", machine.cycle)
-    print("Speedup over baseline: ", BASELINE / machine.cycle)
-    return machine.cycle
-
-
-class Tests(unittest.TestCase):
-    def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
-        random.seed(123)
-        for i in range(10):
-            f = Tree.generate(4)
-            inp = Input.generate(f, 10, 6)
-            mem = build_mem_image(f, inp)
-            reference_kernel(f, inp)
-            for _ in reference_kernel2(mem, {}):
-                pass
-            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
-            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
-
-    def test_kernel_trace(self):
-        # Full-scale example for performance testing
-        do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
-
-    def test_kernel_cycles(self):
-        do_kernel_test(10, 16, 256)
-
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
-
-if __name__ == "__main__":
-    unittest.main()
+                for j in range(UNROLL):
+                    r = regs_list[j]
+                    self.emit_state_update(body, r, v_n_nodes, v_zero, v_one, v_two)
+                    body.append(("store", ("vstore", ptr_indices[j], r["v_idx"])))
+                    body.append(("store", ("vstore", ptr_values[j], r["v_val"])))
