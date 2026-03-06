@@ -289,6 +289,7 @@ class KernelBuilder:
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
+        v_const_idx = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)]
         
         # Persistent state for 32 batches
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
@@ -330,7 +331,7 @@ class KernelBuilder:
                     self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
                     for i in range(curr_num - 1):
                         ni = curr_start + i
-                        self.add("valu", ("==", v_mask, v_idx_p[b], self.scratch_const_vector(ni)))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[ni]))
                         self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
                         self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_nv[ti]))
                 else:
