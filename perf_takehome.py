@@ -284,22 +284,22 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-4 (31 nodes)
-        MAX_OPTIMIZED_DEPTH = 4
+        # Optimized layers 0-3 (15 nodes)
+        MAX_OPTIMIZED_DEPTH = 3
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
-        v_const_idx = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)]
         
         # Persistent state for 32 batches
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (12 sets for interleaving)
-        N_TEMPS = 12
+        # Temp registers (16 sets for interleaving)
+        N_TEMPS = 16
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
+        v_mask_v = [self.alloc_scratch(f"vmk_{i}", VLEN) for i in range(N_TEMPS)]
         v_mask = self.alloc_scratch("v_mask", VLEN)
 
         ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
@@ -327,13 +327,44 @@ class KernelBuilder:
                 if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
-                    # Linear search mux is simple and fits 12 batches well
-                    self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
-                    for i in range(curr_num - 1):
-                        ni = curr_start + i
-                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[ni]))
-                        self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_nv[ti]))
+                    if curr_num == 1:
+                        self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
+                    elif curr_num == 2:
+                        # mux between vdn[1], vdn[2]
+                        self.add("alu", ("const", ts, 1))
+                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
+                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
+                        self.add("valu", ("-", v_t2[ti], vdn[1], vdn[2]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t2[ti], vdn[2]))
+                    elif curr_num == 4:
+                        # binary search mux for vdn[3,4,5,6]
+                        # bit 0 chooses between (3,4) and (5,6)
+                        self.add("alu", ("const", ts, 3))
+                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
+                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
+                        self.add("valu", ("-", v_t1[ti], vdn[3], vdn[4]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], vdn[4])) # v_nv is mux(3,4)
+                        
+                        self.add("alu", ("const", ts, 5))
+                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
+                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
+                        self.add("valu", ("-", v_t1[ti], vdn[5], vdn[6]))
+                        self.add("valu", ("multiply_add", v_t2[ti], v_mask_v[ti], v_t1[ti], vdn[6])) # v_t2 is mux(5,6)
+                        
+                        # then mux between v_nv and v_t2
+                        self.add("valu", ("<", v_mask_v[ti], v_idx_p[b], self.scratch_const_vector(5)))
+                        self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], v_t2[ti]))
+                    else:
+                        # Fallback to linear for 8 nodes (still okay)
+                        self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
+                        for i in range(curr_num - 1):
+                            ni = curr_start + i
+                            self.add("alu", ("const", ts, ni))
+                            self.add("valu", ("vbroadcast", v_t1[ti], ts))
+                            self.add("valu", ("==", v_mask, v_idx_p[b], v_t1[ti]))
+                            self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
+                            self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_nv[ti]))
                 else:
                     # Fallback to scalar loads but use VALU for address calc
                     self.add("valu", ("+", v_t1[ti], v_idx_p[b], v_forest_p))
