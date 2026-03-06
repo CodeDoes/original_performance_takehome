@@ -278,17 +278,21 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-4 (31 nodes)
-        MAX_OPTIMIZED_DEPTH = 4
+        # Optimized layers 0-2 (7 nodes)
+        MAX_OPTIMIZED_DEPTH = 2
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         nst = [self.alloc_scratch(f"nst_{i}") for i in range(N_OPTIMIZED_NODES)]
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
         vdd = [self.alloc_scratch(f"vdd_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
-        v_cidx = {i: self.alloc_scratch(f"vci_{i}", VLEN) for i in range(1, 32)}
-        for i in range(1, 32): self.add("valu", ("vbroadcast", v_cidx[i], self.scratch_const(i)))
+        
+        # Only need constants for the nodes we use in the optimized mux
+        # Level 1 uses idx 1. Level 2 uses idx 3, 5.
+        needed_cidx = [1, 3, 5]
+        v_cidx = {i: self.alloc_scratch(f"vci_{i}", VLEN) for i in needed_cidx}
+        for i in needed_cidx: self.add("valu", ("vbroadcast", v_cidx[i], self.scratch_const(i)))
 
-        # 8 batches per pass for temps to save space
-        N_TEMPS = 8
+        # 4 batches per pass for temps to save space
+        N_TEMPS = 4
         # Persistent state
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
