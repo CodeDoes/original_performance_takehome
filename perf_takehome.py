@@ -289,6 +289,7 @@ class KernelBuilder:
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
+        v_const_idx = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)]
         
         # Persistent state for 32 batches
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
@@ -330,33 +331,52 @@ class KernelBuilder:
                     if curr_num == 1:
                         self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
                     elif curr_num == 2:
-                        # mux between vdn[1], vdn[2]
-                        self.add("load", ("const", ts, 1))
-                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
-                        self.add("valu", ("-", v_t2[ti], vdn[1], vdn[2]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t2[ti], vdn[2]))
+                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[1]))
+                        self.add("valu", ("-", v_t1[ti], vdn[1], vdn[2]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], vdn[2]))
                     elif curr_num == 4:
-                        # binary search mux for vdn[3,4,5,6]
-                        # bit 0 chooses between (3,4) and (5,6)
-                        self.add("load", ("const", ts, 3))
-                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
+                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[3]))
                         self.add("valu", ("-", v_t1[ti], vdn[3], vdn[4]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], vdn[4])) # v_nv is mux(3,4)
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], vdn[4]))
                         
-                        self.add("load", ("const", ts, 5))
-                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
-                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_t1[ti]))
+                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[5]))
                         self.add("valu", ("-", v_t1[ti], vdn[5], vdn[6]))
-                        self.add("valu", ("multiply_add", v_t2[ti], v_mask_v[ti], v_t1[ti], vdn[6])) # v_t2 is mux(5,6)
+                        self.add("valu", ("multiply_add", v_t2[ti], v_mask_v[ti], v_t1[ti], vdn[6]))
                         
-                        # then mux between v_nv and v_t2
-                        self.add("valu", ("<", v_mask_v[ti], v_idx_p[b], self.scratch_const_vector(5)))
+                        self.add("valu", ("<", v_mask_v[ti], v_idx_p[b], v_const_idx[5]))
                         self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
                         self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], v_t2[ti]))
                     else:
-                        # Fallback to linear for 8 nodes (still okay)
+                        self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
+                        for i in range(curr_num - 1):
+                            ni = curr_start + i
+                            self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[ni]))
+                            self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
+                            self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], v_nv[ti]))
+                    elif curr_num == 8:
+                        # binary search mux for vdn[7..14]
+                        # layer 1: (7,8), (9,10), (11,12), (13,14) -> v_mx[0..3]
+                        # bit 0 chooses
+                        self.add("load", ("const", ts, 7))
+                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_t1[ti]))
+                        self.add("valu", ("-", v_t1[ti], vdn[7], vdn[8]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[8])) # mx0
+                        
+                        self.add("load", ("const", ts, 9))
+                        self.add("valu", ("vbroadcast", v_t1[ti], ts))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_t1[ti]))
+                        self.add("valu", ("-", v_t1[ti], vdn[9], vdn[10]))
+                        self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[10])) # mx1
+                        
+                        # mux between mx0 and mx1 using bit 1
+                        self.add("valu", ("<", v_mask, v_idx_p[b], self.scratch_const_vector(9)))
+                        self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti])) # v_nv is mux(7..10)
+                        
+                        # same for (11..14)
+                        # ... wait, I'm running out of registers.
+                        # Let's just use linear for 8 nodes but with 2 nodes at a time
                         self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
                         for i in range(curr_num - 1):
                             ni = curr_start + i
