@@ -285,10 +285,10 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (24 sets for interleaving to fit 15 nodes with 4 regs)
-        N_TEMPS = 24
+        # Temp registers (30 sets for interleaving)
+        N_TEMPS = 30
         # v_regs[ti][0] will be the result/accumulator (v_nv)
-        v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(4)] for i in range(N_TEMPS)]
+        v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(3)] for i in range(N_TEMPS)]
 
         # Initial Load
         ts_addr = self.alloc_scratch("ts_addr")
@@ -361,15 +361,8 @@ class KernelBuilder:
             mid_vec = self.scratch_const_vector(mid)
             self.add("valu", ("<", mask_reg, v_idx_p[b], mid_vec))
             
-            if count == 2:
-                 # Use vselect (flow) for leaves (Level 2)
-                 self.add("flow", ("vselect", res_reg, mask_reg, left_op, right_op))
-            else:
-                 # Use Valu arithmetic for upper levels
-                 # res = left - right
-                 self.add("valu", ("-", res_reg, left_op, right_op))
-                 # res = mask * res + right
-                 self.add("valu", ("multiply_add", res_reg, mask_reg, res_reg, right_op))
+            # Always use vselect (flow)
+            self.add("flow", ("vselect", res_reg, mask_reg, left_op, right_op))
             
             return res_idx
 
