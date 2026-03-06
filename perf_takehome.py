@@ -254,7 +254,7 @@ class KernelBuilder:
                 v_one_vec = self.scratch_const_vector(1)
                 v_val1 = self.scratch_const_vector(val1)
                 self.add("valu", ("multiply_add", v_t1, v_val, v_one_vec, v_val1))
-                self.add("valu", (op3, v_t2, v_val, self.scratch_const(val3)))
+                self.add("valu", (op3, v_t2, v_val, self.scratch_const_vector(val3)))
                 self.add("valu", (op2, v_val, v_t1, v_t2))
             else:
                 v_val1 = self.scratch_const_vector(val1)
@@ -287,6 +287,7 @@ class KernelBuilder:
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
+        v_cni = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)]
         
         # Persistent state
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
@@ -324,11 +325,10 @@ class KernelBuilder:
                 if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
-                    # Linear search mux: nv = node[end]; for i in range(start, end-1): nv = (idx==i) ? node[i] : nv
                     self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
                     for i in range(curr_num - 1):
                         ni = curr_start + i
-                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], self.scratch_const_vector(ni)))
+                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], v_cni[ni]))
                         self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
                         self.add("valu", ("multiply_add", v_nv[ti], v_ct[ti], v_t1[ti], v_nv[ti]))
                 else:
@@ -347,14 +347,6 @@ class KernelBuilder:
                 self.add("valu", ("multiply_add", v_idx_p[b], v_idx_p[b], v_two, v_t1[ti]))
                 self.add("valu", ("<", v_t1[ti], v_idx_p[b], v_nn))
                 self.add("valu", ("*", v_idx_p[b], v_idx_p[b], v_t1[ti]))
-
-        # Final Store
-        for b in range(batch_size // VLEN):
-            self.add("store", ("vstore", ba_idx[b], v_idx_p[b]))
-            self.add("store", ("vstore", ba_val[b], v_val_p[b]))
-
-        self.instrs = self.build(self.raw_slots, vliw=True)
-        self.raw_slots = []
 
         # Final Store
         for b in range(batch_size // VLEN):
