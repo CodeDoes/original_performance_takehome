@@ -277,6 +277,9 @@ class KernelBuilder:
 
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+        
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
         # Pre-calculate batch addresses
         batch_addr_idx_map = {}
@@ -309,6 +312,7 @@ class KernelBuilder:
         # Process all sub-batches with maximum interleaving
         N_BATCHES = batch_size // VLEN
         v_indices = [self.alloc_scratch(f"v_idx_{b}", VLEN) for b in range(N_BATCHES)]
+        v_indices_abs = [self.alloc_scratch(f"v_idx_abs_{b}", VLEN) for b in range(N_BATCHES)]
         v_values = [self.alloc_scratch(f"v_val_{b}", VLEN) for b in range(N_BATCHES)]
         v_node_vals = [self.alloc_scratch(f"v_node_val_{b}", VLEN) for b in range(N_BATCHES)]
         
@@ -318,8 +322,6 @@ class KernelBuilder:
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_{t}", VLEN) for t in range(N_TEMP)]
         v_tmp3 = [self.alloc_scratch(f"v_tmp3_{t}", VLEN) for t in range(N_TEMP)]
         
-        tmp_node_addrs = [[self.alloc_scratch(f"tmp_node_addr_{b}_{vi}") for vi in range(VLEN)] for b in range(N_BATCHES)]
-
         # 0. Initial load from memory
         for b in range(N_BATCHES):
             i = b * VLEN
@@ -333,10 +335,9 @@ class KernelBuilder:
             for b in range(N_BATCHES + W):
                 # 1. Start loads for batch b
                 if b < N_BATCHES:
+                    self.add("valu", ("+", v_indices_abs[b], v_indices[b], v_forest_p))
                     for vi in range(VLEN):
-                        self.add("alu", ("+", tmp_node_addrs[b][vi], self.scratch["forest_values_p"], v_indices[b] + vi))
-                    for vi in range(VLEN):
-                        self.add("load", ("load", v_node_vals[b] + vi, tmp_node_addrs[b][vi]))
+                        self.add("load", ("load", v_node_vals[b] + vi, v_indices_abs[b] + vi))
                 
                 # 2. Hash and update for batch b - W
                 if b >= W:
