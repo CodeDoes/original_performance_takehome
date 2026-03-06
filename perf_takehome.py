@@ -275,8 +275,8 @@ class KernelBuilder:
         v_two = self.scratch_const_vector(2)
         # v_nn and v_forest_p generated on the fly to save space
 
-        # Optimized layers 0-3 (15 nodes)
-        MAX_OPTIMIZED_DEPTH = 3
+        # Optimized layers 0-2 (7 nodes)
+        MAX_OPTIMIZED_DEPTH = 2
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
