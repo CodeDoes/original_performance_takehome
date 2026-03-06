@@ -290,10 +290,8 @@ class KernelBuilder:
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
         
         # Scalar registers for address calculation
-        tmp_addr_idx = self.alloc_scratch("tmp_addr_idx")
-        tmp_addr_val = self.alloc_scratch("tmp_addr_val")
-        tmp_scalar_idx = self.alloc_scratch("tmp_scalar_idx")
-        tmp_scalar_node_addr = self.alloc_scratch("tmp_scalar_node_addr")
+        # Use multiple sets to break dependencies in scalar loads
+        tmp_scalar_node_addrs = [self.alloc_scratch(f"tmp_node_addr_{vi}") for vi in range(VLEN)]
 
         for round in range(rounds):
             for i in range(0, batch_size, VLEN):
@@ -301,21 +299,20 @@ class KernelBuilder:
                 
                 # 1. Load indices and values for the batch
                 self.add("alu", ("+", tmp_addr_idx, self.scratch["inp_indices_p"], i_const))
-                self.add("load", ("vload", v_idx, tmp_addr_idx))
-                
                 self.add("alu", ("+", tmp_addr_val, self.scratch["inp_values_p"], i_const))
+                
+                self.add("load", ("vload", v_idx, tmp_addr_idx))
                 self.add("load", ("vload", v_val, tmp_addr_val))
                 
                 # Debug compare (vectorized)
                 self.add("debug", ("vcompare", v_idx, [(round, i + vi, "idx") for vi in range(VLEN)]))
                 self.add("debug", ("vcompare", v_val, [(round, i + vi, "val") for vi in range(VLEN)]))
 
-                # 2. Load node values (this is the bottleneck, must be scalar loads)
+                # 2. Load node values (optimized with multiple addr registers)
                 for vi in range(VLEN):
-                    # tmp_scalar_node_addr = forest_values_p + v_idx[vi]
-                    self.add("alu", ("+", tmp_scalar_node_addr, self.scratch["forest_values_p"], v_idx + vi))
-                    # v_node_val[vi] = mem[tmp_scalar_node_addr]
-                    self.add("load", ("load", v_node_val + vi, tmp_scalar_node_addr))
+                    self.add("alu", ("+", tmp_scalar_node_addrs[vi], self.scratch["forest_values_p"], v_idx + vi))
+                for vi in range(VLEN):
+                    self.add("load", ("load", v_node_val + vi, tmp_scalar_node_addrs[vi]))
 
                 self.add("debug", ("vcompare", v_node_val, [(round, i + vi, "node_val") for vi in range(VLEN)]))
 
