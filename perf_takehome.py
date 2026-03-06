@@ -244,16 +244,15 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
         
-        tmp1 = self.alloc_scratch("tmp1")
+        tmp_scalar = self.alloc_scratch("tmp_scalar")
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.add("load", ("const", tmp_scalar, i))
+            self.add("load", ("load", self.scratch[v], tmp_scalar))
 
         # Constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
-        vlen_const = self.scratch_const(VLEN)
 
         # Pre-broadcast constants to vectors
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -296,31 +295,19 @@ class KernelBuilder:
         # Preamble pause
         self.add("flow", ("pause",))
 
-        # Vector scratch registers
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
-        
-        # Scalar registers for address calculation
-        # Use multiple sets to break dependencies in scalar loads
-        tmp_addr_idx = self.alloc_scratch("tmp_addr_idx")
-        tmp_addr_val = self.alloc_scratch("tmp_addr_val")
-        
-        # Process all sub-batches with maximum interleaving
+        # Process in chunks to fit in scratch space
+        CHUNK_SIZE = 8
         N_BATCHES = batch_size // VLEN
+        
         v_indices = [self.alloc_scratch(f"v_idx_{b}", VLEN) for b in range(N_BATCHES)]
         v_indices_abs = [self.alloc_scratch(f"v_idx_abs_{b}", VLEN) for b in range(N_BATCHES)]
         v_values = [self.alloc_scratch(f"v_val_{b}", VLEN) for b in range(N_BATCHES)]
         v_node_vals = [self.alloc_scratch(f"v_node_val_{b}", VLEN) for b in range(N_BATCHES)]
         
-        # Temporary registers for hashing (we need a few sets to allow interleaving)
-        N_TEMP = 4
-        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{t}", VLEN) for t in range(N_TEMP)]
-        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{t}", VLEN) for t in range(N_TEMP)]
-        v_tmp3 = [self.alloc_scratch(f"v_tmp3_{t}", VLEN) for t in range(N_TEMP)]
+        # Temporary registers (chunked)
+        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{t}", VLEN) for t in range(CHUNK_SIZE)]
+        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{t}", VLEN) for t in range(CHUNK_SIZE)]
+        v_tmp3 = [self.alloc_scratch(f"v_tmp3_{t}", VLEN) for t in range(CHUNK_SIZE)]
         
         # 0. Initial load from memory
         for b in range(N_BATCHES):
@@ -329,39 +316,57 @@ class KernelBuilder:
             self.add("load", ("vload", v_values[b], batch_addr_val_map[i]))
 
         for round in range(rounds):
-            # We'll use a sliding window to interleave Loads, Hashes, and Updates
-            # Window size of 8 batches
-            W = 8
-            for b in range(N_BATCHES + W):
-                # 1. Start loads for batch b
-                if b < N_BATCHES:
-                    self.add("valu", ("+", v_indices_abs[b], v_indices[b], v_forest_p))
-                    for vi in range(VLEN):
-                        self.add("load", ("load", v_node_vals[b] + vi, v_indices_abs[b] + vi))
+            for chunk_start in range(0, N_BATCHES, CHUNK_SIZE):
+                chunk_end = min(chunk_start + CHUNK_SIZE, N_BATCHES)
+                chunk_indices = range(chunk_start, chunk_end)
                 
-                # 2. Hash and update for batch b - W
-                if b >= W:
-                    pb = b - W
-                    # Use a temp set based on pb % N_TEMP
-                    t = pb % N_TEMP
-                    
-                    # Hash
-                    self.add("valu", ("^", v_values[pb], v_values[pb], v_node_vals[pb]))
-                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        self.add("valu", (op1, v_tmp1[t], v_values[pb], v_c1_map[hi]))
-                        self.add("valu", (op3, v_tmp2[t], v_values[pb], v_c3_map[hi]))
-                        self.add("valu", (op2, v_values[pb], v_tmp1[t], v_tmp2[t]))
+                # 1. Address calculations
+                for b in chunk_indices:
+                    self.add("valu", ("+", v_indices_abs[b], v_indices[b], v_forest_p))
+                
+                # 2. Scalar loads
+                for vi in range(VLEN):
+                    for b in chunk_indices:
+                        # Use absolute address in scratch
+                        self.add("load", ("load", v_node_vals[b] + vi, v_indices_abs[b] + vi))
 
-                    # Update Index
-                    self.add("valu", ("%", v_tmp1[t], v_values[pb], v_two))
-                    self.add("valu", ("==", v_tmp1[t], v_tmp1[t], v_zero))
-                    self.add("flow", ("vselect", v_tmp3[t], v_tmp1[t], v_one, v_two))
-                    self.add("valu", ("*", v_indices[pb], v_indices[pb], v_two))
-                    self.add("valu", ("+", v_indices[pb], v_indices[pb], v_tmp3[t]))
+                # 3. Hash calculation and Index Update
+                for b in chunk_indices:
+                    self.add("valu", ("^", v_values[b], v_values[b], v_node_vals[b]))
+
+                for hi in range(len(HASH_STAGES)):
+                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                    v_c1 = v_c1_map[hi]
+                    v_c3 = v_c3_map[hi]
                     
-                    # Wrap
-                    self.add("valu", ("<", v_tmp1[t], v_indices[pb], v_n_nodes))
-                    self.add("flow", ("vselect", v_indices[pb], v_tmp1[t], v_indices[pb], v_zero))
+                    for b in chunk_indices:
+                        t = b - chunk_start
+                        self.add("valu", (op1, v_tmp1[t], v_values[b], v_c1))
+                        self.add("valu", (op3, v_tmp2[t], v_values[b], v_c3))
+                    
+                    for b in chunk_indices:
+                        t = b - chunk_start
+                        self.add("valu", (op2, v_values[b], v_tmp1[t], v_tmp2[t]))
+
+                # 4. Update indices and Wrap
+                for b in chunk_indices:
+                    t = b - chunk_start
+                    self.add("valu", ("%", v_tmp1[t], v_values[b], v_two))
+                    self.add("valu", ("==", v_tmp1[t], v_tmp1[t], v_zero))
+                
+                for b in chunk_indices:
+                    t = b - chunk_start
+                    self.add("flow", ("vselect", v_tmp3[t], v_tmp1[t], v_one, v_two))
+                    self.add("valu", ("*", v_indices[b], v_indices[b], v_two))
+                
+                for b in chunk_indices:
+                    t = b - chunk_start
+                    self.add("valu", ("+", v_indices[b], v_indices[b], v_tmp3[t]))
+                
+                for b in chunk_indices:
+                    t = b - chunk_start
+                    self.add("valu", ("<", v_tmp1[t], v_indices[b], v_n_nodes))
+                    self.add("flow", ("vselect", v_indices[b], v_tmp1[t], v_indices[b], v_zero))
 
         # 3. Final store to memory
         for b in range(N_BATCHES):
