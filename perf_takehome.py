@@ -295,24 +295,20 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (12 sets for interleaving)
-        N_TEMPS = 12
+        # Temp registers (16 sets for interleaving)
+        N_TEMPS = 16
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
-        v_mask_v = [self.alloc_scratch(f"vmk_{i}", VLEN) for i in range(N_TEMPS)]
         v_mask = self.alloc_scratch("v_mask", VLEN)
 
-        ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
-        ba_val = [self.alloc_scratch(f"bav_{i}") for i in range(0, batch_size, VLEN)]
-        for i in range(0, batch_size, VLEN):
-            self.add("alu", ("+", ba_idx[i//VLEN], self.scratch["inp_indices_p"], self.scratch_const(i)))
-            self.add("alu", ("+", ba_val[i//VLEN], self.scratch["inp_values_p"], self.scratch_const(i)))
-
-        # Initial Load all 256
+        # Initial Load
+        ts_addr = self.alloc_scratch("ts_addr")
         for b in range(batch_size // VLEN):
-            self.add("load", ("vload", v_idx_p[b], ba_idx[b]))
-            self.add("load", ("vload", v_val_p[b], ba_val[b]))
+            self.add("alu", ("+", ts_addr, self.scratch["inp_indices_p"], self.scratch_const(b * VLEN)))
+            self.add("load", ("vload", v_idx_p[b], ts_addr))
+            self.add("alu", ("+", ts_addr, self.scratch["inp_values_p"], self.scratch_const(b * VLEN)))
+            self.add("load", ("vload", v_val_p[b], ts_addr))
 
         # Pre-load nodes for Level 0-4
         for ni in range(N_OPTIMIZED_NODES):
@@ -331,29 +327,29 @@ class KernelBuilder:
                     if curr_num == 1:
                         self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
                     elif curr_num == 2:
-                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[1]))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[1]))
                         self.add("valu", ("-", v_t1[ti], vdn[1], vdn[2]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], vdn[2]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[2]))
                     elif curr_num == 4:
-                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[3]))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[3]))
                         self.add("valu", ("-", v_t1[ti], vdn[3], vdn[4]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], vdn[4]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], vdn[4]))
                         
-                        self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[5]))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[5]))
                         self.add("valu", ("-", v_t1[ti], vdn[5], vdn[6]))
-                        self.add("valu", ("multiply_add", v_t2[ti], v_mask_v[ti], v_t1[ti], vdn[6]))
+                        self.add("valu", ("multiply_add", v_t2[ti], v_mask, v_t1[ti], vdn[6]))
                         
-                        self.add("valu", ("<", v_mask_v[ti], v_idx_p[b], v_const_idx[5]))
+                        self.add("valu", ("<", v_mask, v_idx_p[b], v_const_idx[5]))
                         self.add("valu", ("-", v_t1[ti], v_nv[ti], v_t2[ti]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], v_t2[ti]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_t2[ti]))
                     else:
                         # Linear search mux
                         self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
                         for i in range(curr_num - 1):
                             ni = curr_start + i
-                            self.add("valu", ("==", v_mask_v[ti], v_idx_p[b], v_const_idx[ni]))
+                            self.add("valu", ("==", v_mask, v_idx_p[b], v_const_idx[ni]))
                             self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
-                            self.add("valu", ("multiply_add", v_nv[ti], v_mask_v[ti], v_t1[ti], v_nv[ti]))
+                            self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_nv[ti]))
                 else:
                     # Fallback to scalar loads
                     self.add("valu", ("+", v_t1[ti], v_idx_p[b], v_forest_p))
@@ -373,8 +369,10 @@ class KernelBuilder:
 
         # Final Store
         for b in range(batch_size // VLEN):
-            self.add("store", ("vstore", ba_idx[b], v_idx_p[b]))
-            self.add("store", ("vstore", ba_val[b], v_val_p[b]))
+            self.add("alu", ("+", ts_addr, self.scratch["inp_indices_p"], self.scratch_const(b * VLEN)))
+            self.add("store", ("vstore", ts_addr, v_idx_p[b]))
+            self.add("alu", ("+", ts_addr, self.scratch["inp_values_p"], self.scratch_const(b * VLEN)))
+            self.add("store", ("vstore", ts_addr, v_val_p[b]))
 
         self.instrs = self.build(self.raw_slots, vliw=True)
         self.raw_slots = []
