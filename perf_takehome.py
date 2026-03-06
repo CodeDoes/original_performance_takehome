@@ -282,8 +282,8 @@ class KernelBuilder:
         v_nn = self.alloc_scratch("v_nn", VLEN)
         self.add("valu", ("vbroadcast", v_nn, self.scratch["n_nodes"]))
 
-        # Optimized layers 0-5 (63 nodes)
-        MAX_OPTIMIZED_DEPTH = 5
+        # Optimized layers 0-4 (31 nodes)
+        MAX_OPTIMIZED_DEPTH = 4
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
@@ -293,13 +293,13 @@ class KernelBuilder:
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
         # Temp registers (one set for the whole kernel)
-        N_TEMPS = 2
+        N_TEMPS = 8
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
         v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(N_TEMPS)]
         # Intermediate mux registers for binary search mux
-        v_mx = [self.alloc_scratch(f"vmx_{i}", VLEN) for i in range(32)]
+        v_mx = [self.alloc_scratch(f"vmx_{i}", VLEN) for i in range(16)]
 
         ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
         ba_val = [self.alloc_scratch(f"bav_{i}") for i in range(0, batch_size, VLEN)]
