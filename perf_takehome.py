@@ -337,9 +337,10 @@ class KernelBuilder:
 
         for round in range(rounds):
             # 1. Address calculations and Loads for ALL batches
+            # Use ALU for address calculation to free up VALU slots
             for b in range(N_BATCHES):
-                # Reuse tmp1 for address calculation
-                self.add("valu", ("+", v_tmp1[b], v_indices[b], v_forest_p))
+                for vi in range(VLEN):
+                    self.add("alu", ("+", v_tmp1[b] + vi, v_indices[b] + vi, self.scratch["forest_values_p"]))
                 for vi in range(VLEN):
                     self.add("load", ("load", v_node_vals[b] + vi, v_tmp1[b] + vi))
 
