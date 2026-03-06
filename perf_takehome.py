@@ -284,19 +284,19 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-3 (15 nodes)
-        MAX_OPTIMIZED_DEPTH = 3
+        # Optimized layers 0-4 (31 nodes)
+        MAX_OPTIMIZED_DEPTH = 4
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
-        v_const_idx = [self.scratch_const_vector(i) for i in range(N_OPTIMIZED_NODES)]
+        v_const_idx = [self.scratch_const_vector(i) for i in range(max(N_OPTIMIZED_NODES, batch_size))]
         
         # Persistent state for 32 batches
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (16 sets for interleaving)
-        N_TEMPS = 16
+        # Temp registers (12 sets for interleaving)
+        N_TEMPS = 12
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
@@ -325,7 +325,7 @@ class KernelBuilder:
             for b in range(batch_size // VLEN):
                 ti = b % N_TEMPS
                 
-                if level <= V_DEPTH:
+                if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
                     if curr_num == 1:
