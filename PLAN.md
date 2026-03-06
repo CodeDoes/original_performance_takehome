@@ -1,33 +1,25 @@
-# Optimization Plan: Simplified & High-Performance
+# Architecture & Trade-offs
 
-The current implementation is approaching the theoretical limits of the architecture, but there is a path to further performance by simplifying the approach and maximizing the VLIW slot utilization.
+This document records the architectural decisions made during optimization.
 
-## 1. The Bottleneck Analysis
-- **Load Bottleneck**: Using the `load` engine for 256 elements takes **128 cycles** (2 slots).
-- **VALU Opportunity**: The `valu` engine has **6 slots**. If we can perform "selection" (muxing) in fewer than 128 cycles, it's a win.
-- **Hash Cost**: The hash function takes ~96 cycles on the `valu` engine for all 32 batches.
+## 1. The Mux vs. Load Trade-off
+We initially aimed for a deep Binary Search Mux (Depth 4 or 5) to eliminate most loads. However, empirical testing revealed:
+- **Depth 0-2 (7 nodes)**: Highly effective. Fast vector ALU/Flow ops replace slow scalar loads.
+- **Depth 3 (15 nodes)**: Attempted with `vselect` optimization. While it reduced loads further (112 vs 120 cycles), the extra instruction overhead (Flow or Valu) made it net slower (~2000 cycles).
+- **Decision**: Cap Mux at Depth 2. Use `load` engine (2 slots) for deeper levels to balance the workload.
 
-## 2. The Plan
+## 2. Interleaving Strategy
+To hide the 64-cycle latency of loads and arithmetic, we need many active batches in flight.
+- **Optimal**: `N_TEMPS = 30`. This aligns with `valu` width (6 slots) and fits in scratch space.
+- **Space Constraint**: `N_TEMPS = 32` combined with cached constants exceeded the 1536-word scratch limit. Dynamic constant generation was tested to save space for N=32, but the extra `valu` instructions (broadcasts) caused a performance regression.
 
-### Phase 1: Pure Interleaving (The "Simple" Way)
-Instead of complex manual batch management, we will leverage the scheduler:
-1.  **32-Batch Interleaving**: We will process all 256 inputs every round.
-2.  **Strategic Muxing**: 
-    - **Levels 0-3**: Use the `valu` muxing logic. At Depth 3 (8 nodes), it takes ~24 cycles, which is much faster than 128 cycles of loads.
-    - **Levels 4-10**: Use standard `load` operations. While the `load` engine is busy for 128 cycles, the `valu` engine can be used to finish the hash and index updates of the *previous* batch or other interleaved work.
+## 3. Instruction Selection
+- **Mux Implementation**: Replaced `valu` arithmetic (subtract/multiply-add) with `flow` `vselect` instruction. Since `valu` is the bottleneck (Hash function uses 12 slots/batch) and `flow` is underutilized, this offloading saved ~32 cycles per round.
+- **Hash Function**: Simplified to use `valu` ops. Attempts to simplify further were limited by correctness requirements.
 
-### Phase 2: Refined Scratch Management
-To allow for 32-batch interleaving without running out of scratch space (1536 words):
-1.  **Reuse Temps**: Use only 8 sets of temporary registers. The scheduler is smart enough to pack instructions from 32 batches into these 8 "register windows" if we structure the loop correctly.
-2.  **Vectorized Constants**: Keep only the most frequent constants in scratch space.
-
-### Phase 3: Hash Micro-Optimizations
-1.  **Full `multiply_add` Coverage**: Apply the `(1 << val3) + 1` multiplier trick to all 3 stages that follow the `+ << +` pattern.
-2.  **Pipeline the Hash**: Structure the hash code to allow the scheduler to interleave Stage N of Batch A with Stage M of Batch B.
-
-## 3. Why this isn't "Too Complicated"
-- We stop trying to mux the entire tree. Muxing 1024 nodes (Depth 10) is impossible in scratch space.
-- We rely on the architecture's strengths: 2 load slots are plenty if we keep them busy, and 6 VALU slots are powerful for the top of the tree.
-
-## 4. Expected Outcome
-By focusing on the **LOAD/VALU balance** and maximizing **VLIW density**, we expect to beat the 2,271 cycle mark and move towards the final performance targets.
+## 4. Scratch Space Tetris
+The 1536-word scratch space is the hard limit.
+- **Persistent State**: 512 words.
+- **Constants**: ~200 words (Hash, Mux, Nodes).
+- **Temps**: 30 * 3 vectors = 720 words.
+- **Total**: ~1432 words. Fits comfortably.

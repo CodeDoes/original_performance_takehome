@@ -1,56 +1,48 @@
 # Performance Optimizations for Tree Traversal Kernel
 
-This document summarizes the optimizations implemented for the tree traversal kernel on the custom VLIW SIMD architecture.
+This document summarizes the optimizations implemented for the tree traversal kernel, achieving **1957 cycles** (~75.5x speedup).
 
-## Project Overview
-The goal is to optimize a kernel that performs multiple rounds of tree traversal. Each round involves:
-1. Loading a node value from a perfect binary tree based on a current index.
-2. Updating the current value using an XOR and a hash function.
-3. Updating the current index based on the lower bit of the hashed value.
-
-## Target Architecture
-- **VLIW**: Parallel execution across multiple engines:
-  - `alu`: 12 slots
-  - `valu`: 6 slots (SIMD, VLEN=8)
-  - `load`: 2 slots
-  - `store`: 2 slots
-  - `flow`: 1 slot
-- **SIMD**: Vector length of 8 elements.
-- **Scratch Space**: 1536 words, used for persistent state, temporary variables, and constants.
+## Key Achievements
+- **Cycles**: 1957 (Baseline: 147,734)
+- **Speedup**: ~75.5x
+- **Passed Threshold**: `test_opus4_many_hours` (< 2164 cycles)
 
 ## Implemented Optimizations
 
-### 1. Full Vectorization
-The kernel processes all 256 inputs in parallel using SIMD instructions. It processes 32 batches of 8 elements each.
+### 1. Full Vectorization & Interleaving
+- **SIMD Processing**: Processes all 256 inputs in parallel using 32 SIMD batches (VLEN=8).
+- **Massive Interleaving**: Interleaves instruction streams from **30 independent batches** simultaneously (`N_TEMPS = 30`). This fills VLIW slots effectively.
+- **Why N=30?**: N=32 caused scratch space exhaustion with cached constants. N=30 provides excellent latency hiding while fitting in space.
 
-### 2. Constant Management
-- **Vectorized Constants**: Constants used in VALU operations are pre-broadcasted to scratch space vectors (`scratch_const_vector`) to avoid redundant `vbroadcast` instructions in the main loop.
-- **Persistent State**: Current indices and values for all batches are kept in scratch space (`v_idx_p`, `v_val_p`) across rounds.
+### 2. Balanced Tree Traversal (Depth 2 + vselect)
+- **Hybrid Approach**:
+    - **Levels 0-2 (7 nodes)**: Uses a recursive **Binary Search Mux**.
+    - **Levels 3+**: Falls back to standard scalar `load` operations.
+- **vselect Optimization**: Replaced `valu` arithmetic (subtract/multiply-add) with `flow` `vselect` instruction for Mux levels. This offloads the bottlenecked `valu` engine to the underutilized `flow` engine.
+- **Depth Tuning**: Depth 2 remains optimal. Depth 3 (15 nodes) reduces loads but explodes Valu/Flow instruction counts, causing a net slowdown (2000+ cycles).
 
-### 3. Hash Function Optimization
-- **`multiply_add` usage**: Several hash stages of the form `(val + C1) + (val << C2)` are simplified to `val * (1 << C2 + 1) + C1` using the `multiply_add` instruction, saving cycles and slots.
-- **Interleaved stages**: Hash operations are interleaved with other instructions to maximize slot utilization.
+### 3. Scratch Space Management
+- **Efficient Register Allocation**: Allocated 30 sets of registers.
+- **Cached Constants**: Constants (Mux midpoints, Hash constants) are cached in scratch space. Dynamic generation (using `valu` broadcast) was tested but found to be slower due to `valu` contention.
+- **Persistent State**: Indices and values kept in scratch.
 
-### 4. Tree Traversal (Levels 0-4)
-- **Node Pre-loading**: Tree nodes for the first 5 levels (31 nodes total) are pre-loaded into scratch space as vectors during initialization.
-- **Binary Search Mux**: For levels 0-4, the correct node vector is selected using a bitwise binary search mux implemented with `multiply_add` and bitwise masks. This avoids 8 separate scalar loads and memory address calculations per batch.
+### 4. Configuration Flags
+- Implemented flags in `perf_takehome.py` to easily tune strategies:
+    - `MAX_OPTIMIZED_DEPTH`: 2 vs 3.
+    - `N_TEMPS`: Batch count.
+    - `USE_VSELECT_MUX`: Switch between `valu` and `flow` Mux.
+    - `USE_DYNAMIC_CONSTANTS`: Switch between cached and computed constants.
 
-### 5. Instruction Interleaving and Pipeline Filling
-- **Batch Interleaving**: `N_TEMPS = 8` sets of temporary registers are used to interleave operations from 8 different batches within the same loop. This allows the scheduler to fill the 6 `valu` slots and other VLIW engines effectively, hiding instruction latencies.
+## Failed Experiments (Lessons Learned)
 
-### 6. Scratch Space Optimization
-The memory layout in scratch space was carefully designed to fit:
-- 32 batches of persistent state (512 words).
-- 31 pre-loaded node vectors (248 words).
-- 8 sets of temporary registers.
-- Necessary constants.
-Total usage remains within the 1536-word limit.
+### 1. Depth 3 Mux
+- Increasing Mux to Depth 3 (15 nodes) reduced loads significantly.
+- However, the extra Mux logic (whether Valu or Flow) cost more cycles than the loads saved.
+- Best Depth 3 result: ~2003 cycles (Valu bound).
 
-## Performance Results
-- **Baseline Cycles**: 147,734
-- **Optimized Cycles**: 2,705
-- **Speedup**: **~54.6x**
+### 2. N_TEMPS = 32
+- Caused scratch space exhaustion (1536 words limit) when combined with cached constants.
+- Removing cached constants allowed N=32 but slowed down execution due to Valu overhead.
 
-## Future Work
-- Explore more efficient mux implementations to pre-load level 5 (requiring 32 additional vectors).
-- Further fine-tune batch interleaving and register allocation to reach the next performance tier.
+### 3. Dynamic Constants
+- Generating constants on-the-fly (`vbroadcast`) saved space but increased `valu` pressure by ~40%, causing regression.
