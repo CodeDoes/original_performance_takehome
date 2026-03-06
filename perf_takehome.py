@@ -104,7 +104,6 @@ class KernelBuilder:
             "forest_values_p",
             "inp_indices_p",
             "inp_values_p",
-            "extra_room_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
@@ -183,7 +182,6 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
-    output_assembly_file: str | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -195,55 +193,6 @@ def do_kernel_test(
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
-    # --- Start of new logic to extract and write assembly ---
-    if output_assembly_file:
-        temp_machine = Machine(
-            mem_dump=[], # dummy mem_dump
-            program=[],  # dummy program
-            debug_info=kb.debug_info(),
-            n_cores=N_CORES,
-            value_trace={},
-            trace=False,
-        )
-        assembly_output = []
-        round_counter = 0
-        
-        # Iterate through instructions to identify round boundaries
-        for pc, instr in enumerate(kb.instrs):
-            is_new_round_start = False
-            for engine, slots in instr.items():
-                if engine == "debug":
-                    for slot in slots:
-                        # Check for the start of a new round (batch_i == 0)
-                        if slot[0] == "compare" and len(slot) > 2 and isinstance(slot[2], tuple) and len(slot[2]) > 2 and slot[2][2] == "idx":
-                            current_debug_round = slot[2][0]
-                            current_debug_batch_i = slot[2][1]
-                            if current_debug_round == round_counter and current_debug_batch_i == 0:
-                                is_new_round_start = True
-                                break 
-                if is_new_round_start:
-                    break
-
-            if is_new_round_start and round_counter < 2: # Only for the first two rounds (0 and 1)
-                if round_counter > 0:
-                    assembly_output.append(f"""--- End of Round {round_counter-1} ---""")
-                assembly_output.append(f"""--- Start of Round {round_counter} ---""")
-                round_counter += 1
-
-            if round_counter > 0 and round_counter <= 2: # Capture instructions for round 0 and 1
-                rewritten_instr = temp_machine.rewrite_instr(instr)
-                assembly_output.append(f"""PC {pc}: {rewritten_instr}""")
-
-            if round_counter > 2: # Stop after capturing two full rounds
-                break
-
-        if round_counter > 0 and round_counter <=2: # Append end of last round if it was captured
-            assembly_output.append(f"""--- End of Round {round_counter-1} ---""")
-
-        with open(output_assembly_file, "w") as f:
-            f.writelines(assembly_output)
-
-    # --- End of new logic ---
     value_trace = {}
     machine = Machine(
         mem,
@@ -307,10 +256,6 @@ class Tests(unittest.TestCase):
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
-
-    def test_generate_assembly(self):
-        # Using a small config to keep the assembly file manageable
-        do_kernel_test(4, 2, 4, output_assembly_file="generated_assembly.txt")
 
 
 # To run all the tests:
