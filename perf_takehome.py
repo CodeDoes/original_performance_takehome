@@ -278,30 +278,6 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        n_batches = batch_size // VLEN
-        # Persistent state for each batch
-        v_idx = [self.alloc_scratch(f"vi_{b}", VLEN) for b in range(n_batches)]
-        v_val = [self.alloc_scratch(f"vv_{b}", VLEN) for b in range(n_batches)]
-        
-        # Temporary registers reused across batches to save scratch space
-        n_temp = 8
-        v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(n_temp)]
-        v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(n_temp)]
-        v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(n_temp)]
-        v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(n_temp)]
-
-        # Base addresses for loads/stores
-        ba_idx = [self.alloc_scratch(f"ba_idx_{b}") for b in range(n_batches)]
-        ba_val = [self.alloc_scratch(f"ba_val_{b}") for b in range(n_batches)]
-        for b in range(n_batches):
-            self.add("alu", ("+", ba_idx[b], self.scratch["inp_indices_p"], self.scratch_const(b * VLEN)))
-            self.add("alu", ("+", ba_val[b], self.scratch["inp_values_p"], self.scratch_const(b * VLEN)))
-
-        # Initial Load
-        for b in range(n_batches):
-            self.add("load", ("vload", v_idx[b], ba_idx[b]))
-            self.add("load", ("vload", v_val[b], ba_val[b]))
-
         # Optimized layers 0-4 (31 nodes)
         MAX_OPTIMIZED_DEPTH = 4
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
@@ -311,19 +287,19 @@ class KernelBuilder:
         v_cidx = {i: self.alloc_scratch(f"vci_{i}", VLEN) for i in range(1, 32)}
         for i in range(1, 32): self.add("valu", ("vbroadcast", v_cidx[i], self.scratch_const(i)))
 
-        # 16 batches per pass
-        N_BATCHES = 16
+        # 8 batches per pass for temps to save space
+        N_TEMPS = 8
         # Persistent state
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
         # Temp registers (one set for the whole kernel)
-        v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_BATCHES)]
-        v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_BATCHES)]
-        v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_BATCHES)]
-        v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(N_BATCHES)]
-        v_m1 = [self.alloc_scratch(f"vm1_{i}", VLEN) for i in range(N_BATCHES)]
-        v_m2 = [self.alloc_scratch(f"vm2_{i}", VLEN) for i in range(N_BATCHES)]
+        v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
+        v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
+        v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
+        v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(N_TEMPS)]
+        v_m1 = [self.alloc_scratch(f"vm1_{i}", VLEN) for i in range(N_TEMPS)]
+        v_m2 = [self.alloc_scratch(f"vm2_{i}", VLEN) for i in range(N_TEMPS)]
 
         ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
         ba_val = [self.alloc_scratch(f"bav_{i}") for i in range(0, batch_size, VLEN)]
@@ -354,7 +330,7 @@ class KernelBuilder:
         for round in range(rounds):
             level = round % (forest_height + 1)
             for b in range(batch_size // VLEN):
-                ti = b % N_BATCHES # we process all 32 batches in one round loop
+                ti = b % N_TEMPS # we process all 32 batches in one round loop
                 # This allows the scheduler to interleave them perfectly
                 
                 if level <= MAX_OPTIMIZED_DEPTH:
