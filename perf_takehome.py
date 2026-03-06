@@ -299,6 +299,8 @@ class KernelBuilder:
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
         v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(N_TEMPS)]
+        # Intermediate mux registers for binary search mux
+        v_mx = [self.alloc_scratch(f"vmx_{i}", VLEN) for i in range(32)]
 
         ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
         ba_val = [self.alloc_scratch(f"bav_{i}") for i in range(0, batch_size, VLEN)]
@@ -325,12 +327,41 @@ class KernelBuilder:
                 if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
-                    self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
-                    for i in range(curr_num - 1):
-                        ni = curr_start + i
-                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], v_cni[ni]))
-                        self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_ct[ti], v_t1[ti], v_nv[ti]))
+                    if curr_num == 1:
+                        self.add("valu", ("+", v_nv[ti], vdn[0], v_zero))
+                    else:
+                        # Binary search mux using bitmasking
+                        self.add("load", ("const", ts, curr_start))
+                        self.add("valu", ("vbroadcast", v_ct[ti], ts))
+                        self.add("valu", ("-", v_ct[ti], v_idx_p[b], v_ct[ti]))
+                        
+                        v_mask_const = self.scratch_const_vector(1)
+                        self.add("valu", ("&", v_t1[ti], v_ct[ti], v_mask_const))
+                        self.add("valu", ("==", v_t1[ti], v_t1[ti], v_zero)) # mask = (bit0 == 0)
+                        
+                        prev_layer = [vdn[curr_start + i] for i in range(curr_num)]
+                        next_layer = []
+                        layer_idx = 0
+                        for i in range(0, len(prev_layer), 2):
+                            self.add("valu", ("-", v_t2[ti], prev_layer[i], prev_layer[i+1]))
+                            self.add("valu", ("multiply_add", v_mx[layer_idx], v_t1[ti], v_t2[ti], prev_layer[i+1]))
+                            next_layer.append(v_mx[layer_idx])
+                            layer_idx += 1
+                        
+                        for bit in range(1, level):
+                            v_mask_const = self.scratch_const_vector(1 << bit)
+                            self.add("valu", ("&", v_t1[ti], v_ct[ti], v_mask_const))
+                            self.add("valu", ("==", v_t1[ti], v_t1[ti], v_zero))
+                            
+                            prev_layer = next_layer
+                            next_layer = []
+                            for i in range(0, len(prev_layer), 2):
+                                self.add("valu", ("-", v_t2[ti], prev_layer[i], prev_layer[i+1]))
+                                self.add("valu", ("multiply_add", v_mx[layer_idx], v_t1[ti], v_t2[ti], prev_layer[i+1]))
+                                next_layer.append(v_mx[layer_idx])
+                                layer_idx += 1
+                        
+                        self.add("valu", ("+", v_nv[ti], next_layer[0], v_zero))
                 else:
                     for vi in range(VLEN):
                         self.add("alu", ("+", v_t1[ti] + vi, v_idx_p[b] + vi, self.scratch["forest_values_p"]))
