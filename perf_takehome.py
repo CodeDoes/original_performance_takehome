@@ -49,46 +49,149 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, raw_slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    def get_reads_writes(self, engine, slot):
+        reads = set()
+        writes = set()
+
+        if engine == "alu":
+            op, dest, a1, a2 = slot
+            writes.add(dest)
+            reads.add(a1)
+            reads.add(a2)
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                dest, src = slot[1], slot[2]
+                for i in range(VLEN): writes.add(dest + i)
+                reads.add(src)
+            elif slot[0] == "multiply_add":
+                dest, a, b, c = slot[1], slot[2], slot[3], slot[4]
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(a + i)
+                    reads.add(b + i)
+                    reads.add(c + i)
+            else:
+                op, dest, a1, a2 = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(a1 + i)
+                    reads.add(a2 + i)
+        elif engine == "load":
+            if slot[0] == "load":
+                dest, addr = slot[1], slot[2]
+                writes.add(dest)
+                reads.add(addr)
+            elif slot[0] == "load_offset":
+                dest, addr, offset = slot[1], slot[2], slot[3]
+                writes.add(dest + offset)
+                reads.add(addr + offset)
+            elif slot[0] == "vload":
+                dest, addr = slot[1], slot[2]
+                for i in range(VLEN): writes.add(dest + i)
+                reads.add(addr)
+            elif slot[0] == "const":
+                dest, val = slot[1], slot[2]
+                writes.add(dest)
+        elif engine == "store":
+            if slot[0] == "store":
+                addr, src = slot[1], slot[2]
+                reads.add(addr)
+                reads.add(src)
+            elif slot[0] == "vstore":
+                addr, src = slot[1], slot[2]
+                reads.add(addr)
+                for i in range(VLEN): reads.add(src + i)
+        elif engine == "flow":
+            if slot[0] == "select":
+                dest, cond, a, b = slot[1], slot[2], slot[3], slot[4]
+                writes.add(dest)
+                reads.add(cond)
+                reads.add(a)
+                reads.add(b)
+            elif slot[0] == "add_imm":
+                dest, a, imm = slot[1], slot[2], slot[3]
+                writes.add(dest)
+                reads.add(a)
+            elif slot[0] == "vselect":
+                dest, cond, a, b = slot[1], slot[2], slot[3], slot[4]
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(cond + i)
+                    reads.add(a + i)
+                    reads.add(b + i)
+            elif slot[0] in ("cond_jump", "cond_jump_rel"):
+                reads.add(slot[1])
+            elif slot[0] == "jump_indirect":
+                reads.add(slot[1])
+            elif slot[0] == "trace_write":
+                reads.add(slot[1])
+            elif slot[0] == "coreid":
+                writes.add(slot[1])
+        elif engine == "debug":
+            if slot[0] == "compare":
+                reads.add(slot[1])
+            elif slot[0] == "vcompare":
+                loc = slot[1]
+                for i in range(VLEN): reads.add(loc + i)
+
+        return reads, writes
+
+    def build(self, raw_slots: list[tuple[Engine, tuple]], vliw: bool = True):
         if not vliw:
-            # Original behavior: one slot per instruction bundle
             instrs = []
             for engine, slot in raw_slots:
                 instrs.append({engine: [slot]})
             return instrs
-        else:
-            # VLIW packing logic
-            packed_instrs = []
-            current_bundle = defaultdict(list)
 
-            for engine, slot in raw_slots:
-                if engine == "debug":
-                    # Finalize any pending instructions before the debug
-                    if current_bundle:
-                        packed_instrs.append(dict(current_bundle))
-                        current_bundle = defaultdict(list)
-                    # Debug itself forms a single-slot bundle
-                    packed_instrs.append({engine: [slot]})
-                    current_bundle = defaultdict(list) # Ensure it's clear for next instruction
-                elif engine == "flow":
-                    # Finalize any pending instructions before the flow
-                    if current_bundle:
-                        packed_instrs.append(dict(current_bundle))
-                        current_bundle = defaultdict(list)
-                    # Flow itself forms a single-slot bundle
-                    packed_instrs.append({engine: [slot]})
-                    current_bundle = defaultdict(list) # Ensure it's clear for next instruction
-                else:
-                    # For other engines, check slot limits
-                    if len(current_bundle[engine]) >= SLOT_LIMITS.get(engine, 1):
-                        packed_instrs.append(dict(current_bundle))
-                        current_bundle = defaultdict(list)
-                    current_bundle[engine].append(slot)
+        packed_instrs = []
+        current_bundle = defaultdict(list)
+        bundle_reads = set()
+        bundle_writes = set()
 
-            # Add any remaining slots in the current_bundle
-            if current_bundle:
+        for engine, slot in raw_slots:
+            reads, writes = self.get_reads_writes(engine, slot)
+            
+            # Check for hazards
+            # RAW: current slot reads something written in current bundle
+            raw_hazard = any(r in bundle_writes for r in reads)
+            # WAW: current slot writes something already written in current bundle
+            waw_hazard = any(w in bundle_writes for w in writes)
+            # Structural: engine limit reached
+            structural_hazard = len(current_bundle[engine]) >= SLOT_LIMITS.get(engine, 1)
+            
+            # Special case for 'flow', 'pause', and 'debug'
+            break_hazard = False
+            if engine == "flow":
+                if slot[0] in ("pause", "halt", "cond_jump", "cond_jump_rel", "jump", "jump_indirect"):
+                    break_hazard = True
+            elif engine == "debug":
+                break_hazard = True
+
+            if raw_hazard or waw_hazard or structural_hazard or break_hazard:
+                if current_bundle:
+                    packed_instrs.append(dict(current_bundle))
+                    current_bundle = defaultdict(list)
+                    bundle_reads = set()
+                    bundle_writes = set()
+                
+                # Re-calculate hazards for the new empty bundle
+                reads, writes = self.get_reads_writes(engine, slot)
+
+            current_bundle[engine].append(slot)
+            bundle_reads.update(reads)
+            bundle_writes.update(writes)
+
+            # If this was a break_hazard, we should also break AFTER it
+            if break_hazard:
                 packed_instrs.append(dict(current_bundle))
-            return packed_instrs
+                current_bundle = defaultdict(list)
+                bundle_reads = set()
+                bundle_writes = set()
+
+        if current_bundle:
+            packed_instrs.append(dict(current_bundle))
+        
+        return packed_instrs
 
     def add(self, engine: Engine, slot: tuple):
         # Add raw (engine, slot) tuples to a list for later packing
@@ -171,43 +274,43 @@ class KernelBuilder:
             for i in range(batch_size):
                 i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
+                self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                self.add("load", ("load", tmp_idx, tmp_addr))
+                self.add("debug", ("compare", tmp_idx, (round, i, "idx")))
                 # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+                self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
+                self.add("load", ("load", tmp_val, tmp_addr))
+                self.add("debug", ("compare", tmp_val, (round, i, "val")))
                 # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+                self.add("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
+                self.add("load", ("load", tmp_node_val, tmp_addr))
+                self.add("debug", ("compare", tmp_node_val, (round, i, "node_val")))
                 # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+                self.add("alu", ("^", tmp_val, tmp_val, tmp_node_val))
+                for hash_engine, hash_slot in self.build_hash(tmp_val, tmp1, tmp2, round, i):
+                    self.add(hash_engine, hash_slot)
+                self.add("debug", ("compare", tmp_val, (round, i, "hashed_val")))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+                self.add("alu", ("%", tmp1, tmp_val, two_const))
+                self.add("alu", ("==", tmp1, tmp1, zero_const))
+                self.add("flow", ("select", tmp3, tmp1, one_const, two_const))
+                self.add("alu", ("*", tmp_idx, tmp_idx, two_const))
+                self.add("alu", ("+", tmp_idx, tmp_idx, tmp3))
+                self.add("debug", ("compare", tmp_idx, (round, i, "next_idx")))
                 # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
+                self.add("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"]))
+                self.add("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const))
+                self.add("debug", ("compare", tmp_idx, (round, i, "wrapped_idx")))
                 # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
+                self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                self.add("store", ("store", tmp_addr, tmp_idx))
                 # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
+                self.add("store", ("store", tmp_addr, tmp_val))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        self.add("flow", ("pause",))
+        self.instrs = self.build(self.raw_slots, vliw=True)
+        self.raw_slots = []
 
 BASELINE = 147734
 
