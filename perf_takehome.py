@@ -278,8 +278,8 @@ class KernelBuilder:
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Optimized layers 0-2 (7 nodes)
-        MAX_OPTIMIZED_DEPTH = 2
+        # Optimized layers 0-3 (15 nodes)
+        MAX_OPTIMIZED_DEPTH = 3
         N_OPTIMIZED_NODES = (2 ** (MAX_OPTIMIZED_DEPTH + 1)) - 1
         ts_node = self.alloc_scratch("ts_node")
         vdn = [self.alloc_scratch(f"vdn_{i}", VLEN) for i in range(N_OPTIMIZED_NODES)]
@@ -288,10 +288,10 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (30 sets for interleaving)
-        N_TEMPS = 30
+        # Temp registers (20 sets for interleaving to fit 15 nodes with 4 regs)
+        N_TEMPS = 20
         # v_regs[ti][0] will be the result/accumulator (v_nv)
-        v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(3)] for i in range(N_TEMPS)]
+        v_regs = [[self.alloc_scratch(f"vr_{i}_{j}", VLEN) for j in range(4)] for i in range(N_TEMPS)]
 
         # Initial Load
         ts_addr = self.alloc_scratch("ts_addr")
@@ -340,14 +340,20 @@ class KernelBuilder:
                 # Alloc new reg
                 res_idx = remaining_regs[0]
                 res_reg = v_regs[ti][res_idx]
-                
-            mask_reg = v_regs[ti][2] # Use the last register as mask (v_regs has 3 regs: 0, 1, 2)
-            # Wait, if we recurse deep, we might need more?
-            # Max depth 2 (4 items).
-            # L(2) -> reg 0. R(2) -> reg 1. Comb -> reg 0.
-            # L(2): L(1)->vdn, R(1)->vdn. Comb -> reg 0.
-            # So we need reg 0 and reg 1.
-            # v_regs has 3 regs. Safe.
+            
+            # Find a free register for mask (one not holding Left or Right results)
+            used_regs = set()
+            if isinstance(left_res, int): used_regs.add(left_res)
+            if isinstance(right_res, int): used_regs.add(right_res)
+            
+            mask_idx = -1
+            for r in regs_indices:
+                if r not in used_regs:
+                    mask_idx = r
+                    break
+            
+            if mask_idx == -1: raise Exception("No register for mask")
+            mask_reg = v_regs[ti][mask_idx]
             
             # Resolve operands
             left_op = vdn[left_res[1]] if isinstance(left_res, tuple) else v_regs[ti][left_res]
@@ -355,8 +361,7 @@ class KernelBuilder:
             
             # Mux logic: res = (idx < mid) ? left : right
             self.add("valu", ("<", mask_reg, v_idx_p[b], self.scratch_const_vector(mid)))
-            self.add("valu", ("-", res_reg, left_op, right_op)) # res = left - right
-            self.add("valu", ("multiply_add", res_reg, mask_reg, res_reg, right_op))
+            self.add("flow", ("vselect", res_reg, mask_reg, left_op, right_op))
             
             return res_idx
 
@@ -368,8 +373,8 @@ class KernelBuilder:
                 if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
-                    # Use registers 0, 1 for data, 2 for mask
-                    res = build_mux(curr_start, curr_num, [0, 1])
+                    # Use registers 0, 1, 2, 3 for data
+                    res = build_mux(curr_start, curr_num, [0, 1, 2, 3])
                     if isinstance(res, tuple):
                          # Just a single node, move to reg 0
                          self.add("valu", ("+", v_regs[ti][0], vdn[res[1]], v_zero))
