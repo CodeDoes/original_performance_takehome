@@ -294,12 +294,12 @@ class KernelBuilder:
         v_idx_p = [self.alloc_scratch(f"vip_{b}", VLEN) for b in range(batch_size // VLEN)]
         v_val_p = [self.alloc_scratch(f"vvp_{b}", VLEN) for b in range(batch_size // VLEN)]
         
-        # Temp registers (16 sets for interleaving)
-        N_TEMPS = 16
+        # Temp registers (12 sets for interleaving)
+        N_TEMPS = 12
         v_nv = [self.alloc_scratch(f"vnv_{i}", VLEN) for i in range(N_TEMPS)]
         v_t1 = [self.alloc_scratch(f"vt1_{i}", VLEN) for i in range(N_TEMPS)]
         v_t2 = [self.alloc_scratch(f"vt2_{i}", VLEN) for i in range(N_TEMPS)]
-        v_ct = [self.alloc_scratch(f"vct_{i}", VLEN) for i in range(N_TEMPS)]
+        v_mask = self.alloc_scratch("v_mask", VLEN)
 
         ba_idx = [self.alloc_scratch(f"bai_{i}") for i in range(0, batch_size, VLEN)]
         ba_val = [self.alloc_scratch(f"bav_{i}") for i in range(0, batch_size, VLEN)]
@@ -326,13 +326,13 @@ class KernelBuilder:
                 if level <= MAX_OPTIMIZED_DEPTH:
                     curr_start = (1 << level) - 1
                     curr_num = 1 << level
-                    # Linear search mux is simple and fits 16 batches well
+                    # Linear search mux is simple and fits 12 batches well
                     self.add("valu", ("+", v_nv[ti], vdn[curr_start + curr_num - 1], v_zero))
                     for i in range(curr_num - 1):
                         ni = curr_start + i
-                        self.add("valu", ("==", v_ct[ti], v_idx_p[b], self.scratch_const_vector(ni)))
+                        self.add("valu", ("==", v_mask, v_idx_p[b], self.scratch_const_vector(ni)))
                         self.add("valu", ("-", v_t1[ti], vdn[ni], v_nv[ti]))
-                        self.add("valu", ("multiply_add", v_nv[ti], v_ct[ti], v_t1[ti], v_nv[ti]))
+                        self.add("valu", ("multiply_add", v_nv[ti], v_mask, v_t1[ti], v_nv[ti]))
                 else:
                     # Fallback to scalar loads but use VALU for address calc
                     self.add("valu", ("+", v_t1[ti], v_idx_p[b], v_forest_p))
